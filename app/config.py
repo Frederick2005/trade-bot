@@ -3,12 +3,10 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 from loguru import logger
 
-# Load .env file into environment
 load_dotenv()
 
 
 def _require(key: str) -> str:
-    """Fetch a required env variable — crash early with a clear message if missing."""
     value = os.getenv(key)
     if not value:
         raise ValueError(f"Missing required environment variable: {key}")
@@ -16,7 +14,6 @@ def _require(key: str) -> str:
 
 
 def _optional(key: str, default: str = "") -> str:
-    """Fetch an optional env variable with a fallback default."""
     return os.getenv(key, default)
 
 
@@ -62,19 +59,19 @@ TELEGRAM = TelegramConfig(
 )
 
 if not TELEGRAM.enabled:
-    logger.warning("Telegram credentials not set — notifications disabled until configured.")
+    logger.warning("Telegram not configured — notifications disabled.")
 
 
-# ── Trading settings ──────────────────────────────────────────────────────────
+# ── Trading ───────────────────────────────────────────────────────────────────
 
 class TradingConfig(BaseModel):
-    mode: str                  # 'paper' or 'live'
-    symbols: list[str]         # ['BTCUSDT', 'ETHUSDT']
-    risk_per_trade: float      # 0.01 = 1%
-    max_leverage: int          # hard ceiling
-    daily_loss_limit: float    # 0.03 = 3%
-    max_drawdown: float        # 0.10 = 10%
-    max_open_trades: int       # 2
+    mode: str
+    symbols: list[str]
+    risk_per_trade: float
+    max_leverage: int
+    daily_loss_limit: float
+    max_drawdown: float
+    max_open_trades: int
 
 TRADING = TradingConfig(
     mode=_optional("TRADING_MODE", "paper"),
@@ -90,8 +87,8 @@ TRADING = TradingConfig(
 # ── Timeframes ────────────────────────────────────────────────────────────────
 
 class TimeframeConfig(BaseModel):
-    signal: str     # '1h' — strategy signals generated here
-    trend: str      # '4h' — higher timeframe trend filter
+    signal: str
+    trend: str
 
 TIMEFRAMES = TimeframeConfig(
     signal=_optional("SIGNAL_TIMEFRAME", "1h"),
@@ -99,13 +96,13 @@ TIMEFRAMES = TimeframeConfig(
 )
 
 
-# ── Strategy parameters ───────────────────────────────────────────────────────
+# ── Strategy ──────────────────────────────────────────────────────────────────
 
 class StrategyConfig(BaseModel):
-    rsi_lower: float        # min RSI to enter
-    rsi_upper: float        # max RSI to enter
-    atr_multiplier: float   # stop loss = ATR * this
-    min_risk_reward: float  # skip trade if RR below this
+    rsi_lower: float
+    rsi_upper: float
+    atr_multiplier: float
+    min_risk_reward: float
 
 STRATEGY = StrategyConfig(
     rsi_lower=float(_optional("RSI_LOWER", "45")),
@@ -115,12 +112,28 @@ STRATEGY = StrategyConfig(
 )
 
 
-# ── Notifications schedule ────────────────────────────────────────────────────
+# ── AI ────────────────────────────────────────────────────────────────────────
+
+class AIConfig(BaseModel):
+    min_confidence: float
+    min_trades_to_train: int
+    retrain_every_days: int
+    model_dir: str
+
+AI = AIConfig(
+    min_confidence=float(_optional("AI_MIN_CONFIDENCE", "0.70")),
+    min_trades_to_train=int(_optional("AI_MIN_TRADES", "200")),
+    retrain_every_days=int(_optional("AI_RETRAIN_DAYS", "7")),
+    model_dir=_optional("AI_MODEL_DIR", "models"),
+)
+
+
+# ── Notifications ─────────────────────────────────────────────────────────────
 
 class NotificationConfig(BaseModel):
-    weekly_report_day: str   # 'sunday'
-    weekly_report_hour: int  # hour in UTC
-    heartbeat_hours: int     # send heartbeat every X hours
+    weekly_report_day: str
+    weekly_report_hour: int
+    heartbeat_hours: int
 
 NOTIFICATIONS = NotificationConfig(
     weekly_report_day=_optional("WEEKLY_REPORT_DAY", "sunday"),
@@ -131,16 +144,17 @@ NOTIFICATIONS = NotificationConfig(
 
 # ── Startup summary ───────────────────────────────────────────────────────────
 
-def log_config():
-    """Log a safe summary of loaded config on startup — never logs secrets."""
-    logger.info("=== Configuration loaded ===")
-    logger.info(f"Mode:           {TRADING.mode.upper()}")
-    logger.info(f"Symbols:        {', '.join(TRADING.symbols)}")
-    logger.info(f"Binance:        {'testnet' if BINANCE.testnet else 'LIVE'}")
-    logger.info(f"Risk per trade: {TRADING.risk_per_trade * 100:.1f}%")
-    logger.info(f"Max leverage:   {TRADING.max_leverage}x")
-    logger.info(f"Daily loss limit: {TRADING.daily_loss_limit * 100:.1f}%")
-    logger.info(f"Max drawdown:   {TRADING.max_drawdown * 100:.1f}%")
-    logger.info(f"Signal TF:      {TIMEFRAMES.signal} | Trend TF: {TIMEFRAMES.trend}")
-    logger.info(f"Telegram:       {'enabled' if TELEGRAM.enabled else 'disabled'}")
-    logger.info("============================")
+def log_config() -> None:
+    logger.info("=" * 40)
+    logger.info("Bot configuration loaded")
+    logger.info(f"  Mode        : {TRADING.mode.upper()}")
+    logger.info(f"  Symbols     : {', '.join(TRADING.symbols)}")
+    logger.info(f"  Binance     : {'TESTNET' if BINANCE.testnet else 'LIVE ⚠️'}")
+    logger.info(f"  Risk/trade  : {TRADING.risk_per_trade * 100:.1f}%")
+    logger.info(f"  Max leverage: {TRADING.max_leverage}x")
+    logger.info(f"  Daily limit : {TRADING.daily_loss_limit * 100:.1f}%")
+    logger.info(f"  Max drawdown: {TRADING.max_drawdown * 100:.1f}%")
+    logger.info(f"  Signal TF   : {TIMEFRAMES.signal}  Trend TF: {TIMEFRAMES.trend}")
+    logger.info(f"  AI min conf : {AI.min_confidence * 100:.0f}%")
+    logger.info(f"  Telegram    : {'enabled' if TELEGRAM.enabled else 'disabled'}")
+    logger.info("=" * 40)
