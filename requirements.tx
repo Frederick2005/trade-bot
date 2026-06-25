@@ -1,0 +1,42 @@
+# ── Binance connectivity ─────────────────────────────────────────────────────
+python-binance==1.0.19          # Binance REST + WebSocket (kline streams)
+websockets==12.0                # Low-level WebSocket support used by python-binance
+
+# ── Async runtime ─────────────────────────────────────────────────────────────        # Async event loop (stdlib wrapper — explicit pin)
+aiohttp==3.9.5                  # Async HTTP (used internally by python-binance)
+
+# ── Technical indicators ──────────────────────────────────────────────────────
+pandas==2.2.2                   # Candle dataframes, rolling windows
+# EMA, RSI, ATR — one-line indicator calls              # EMA, RSI, ATR — one-line indicator calls
+numpy==1.26.4                   # Array math for indicator calculations
+
+# ── Supabase / database ───────────────────────────────────────────────────────
+supabase==2.5.0                 # Supabase Python client (REST + realtime)
+postgrest==0.16.8               # PostgREST client used by supabase-py
+httpx==0.27.0                   # Async HTTP client (supabase-py dependency)
+
+# ── Scheduling ────────────────────────────────────────────────────────────────
+apscheduler==3.10.4             # Weekly report, daily loss reset, heartbeat jobs
+
+# ── Telegram notifications ────────────────────────────────────────────────────
+python-telegram-bot==21.3       # Send alerts + receive /pause /closeall commands
+
+# ── Configuration + secrets ───────────────────────────────────────────────────
+python-dotenv==1.0.1            # Loads .env file into os.environ
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+loguru==0.7.2                   # Clean structured logging to file + stdout
+
+# ── Backtesting ───────────────────────────────────────────────────────────────
+backtesting==0.3.3              # scripts/backtest.py strategy runner
+
+# ── Data validation ───────────────────────────────────────────────────────────
+pydantic==2.7.1                 # Config models, trade/signal schemas
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest==8.2.1                   # Test runner
+pytest-asyncio==0.23.7          # Async test support (for stream + execution tests)
+
+scikit-learn==1.5.0        # ML models — RandomForest, LogisticRegression
+xgboost==2.0.3             # XGBoost — best performer on tabular trading data
+joblib==1.4.2              # Save and load trained models to disk
