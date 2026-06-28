@@ -8,7 +8,7 @@ from loguru import logger
 _candles: dict[tuple, pd.DataFrame] = defaultdict(pd.DataFrame)
 
 # Minimum candles needed before indicators are valid
-MIN_CANDLES = 210
+MIN_CANDLES = 100   # EMA200 needs 200 + a few warm-up bars
 
 
 def update(symbol: str, timeframe: str, candle: dict) -> None:

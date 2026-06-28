@@ -34,3 +34,38 @@ def check_connection() -> bool:
     except Exception as e:
         logger.error(f"Supabase health check failed: {e}")
         return False
+
+
+# ── Bot state persistence ─────────────────────────────────────────────────────
+
+def get_state_value(key: str) -> str | None:
+    """Fetch a single value from the bot_state table."""
+    try:
+        client = get_client()
+        result = (
+            client.table("bot_state")
+            .select("value")
+            .eq("key", key)
+            .limit(1)
+            .execute()
+        )
+        if result.data:
+            return result.data[0]["value"]
+        return None
+    except Exception as e:
+        logger.error(f"Failed to get state value '{key}': {e}")
+        return None
+
+
+def set_state_value(key: str, value: str) -> bool:
+    """Upsert a key/value pair in the bot_state table."""
+    try:
+        client = get_client()
+        client.table("bot_state").upsert(
+            {"key": key, "value": value},
+            on_conflict="key"
+        ).execute()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to set state value '{key}': {e}")
+        return False

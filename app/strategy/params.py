@@ -64,6 +64,6 @@ def _load_from_db() -> StrategyParams:
         rsi_upper=STRATEGY.rsi_upper,
         atr_multiplier=STRATEGY.atr_multiplier,
         ema_gap_min=0.0,
-        min_volume_ratio=1.0,
+        min_volume_ratio=1.2,
         min_rr=STRATEGY.min_risk_reward,
     )

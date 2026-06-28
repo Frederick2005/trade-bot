@@ -1,51 +1,113 @@
+import uuid
+from datetime import datetime, timezone
 from loguru import logger
-from app.config import TRADING
-from app.state import state
+from app.state import state, OpenTrade
 
 
-def enforce_leverage(requested: int) -> int:
-    if requested > TRADING.max_leverage:
-        logger.warning(
-            f"Leverage {requested}x exceeds ceiling "
-            f"{TRADING.max_leverage}x — capped"
-        )
-        return TRADING.max_leverage
-    return requested
+async def open_order(
+    symbol: str,
+    side: str,
+    lot_size: float,
+    entry_price: float,
+    stop_loss: float,
+    take_profit: float,
+    strategy_version: str,
+) -> dict | None:
+    order_id  = f"PAPER-{uuid.uuid4().hex[:8].upper()}"
+    opened_at = datetime.now(timezone.utc).isoformat()
+
+    trade = OpenTrade(
+        trade_id=order_id,
+        symbol=symbol,
+        side=side,
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        lot_size=lot_size,
+        opened_at=opened_at,
+        strategy_version=strategy_version,
+        order_id=order_id,
+    )
+    state.open_trades[symbol] = trade
+
+    logger.info(
+        f"[PAPER] Order opened: {symbol} {side} "
+        f"entry={entry_price:.2f} SL={stop_loss:.2f} "
+        f"TP={take_profit:.2f} lot={lot_size:.6f}"
+    )
+    return {
+        "order_id":    order_id,
+        "symbol":      symbol,
+        "side":        side,
+        "entry_price": entry_price,
+        "lot_size":    lot_size,
+        "opened_at":   opened_at,
+        "status":      "FILLED",
+    }
 
 
-def auto_reduce_leverage(balance: float, original_leverage: int) -> int:
+async def close_order(
+    symbol: str,
+    exit_price: float,
+    reason: str,
+) -> dict | None:
+    trade = state.open_trades.get(symbol)
+    if not trade:
+        logger.warning(f"[PAPER] No open trade found for {symbol}")
+        return None
+
+    if trade.side == "LONG":
+        pnl = (exit_price - trade.entry_price) * trade.lot_size
+    else:
+        pnl = (trade.entry_price - exit_price) * trade.lot_size
+
+    pnl_pct = pnl / state.balance if state.balance else 0.0
+
+    state.record_closed_trade(pnl)
+    del state.open_trades[symbol]
+
+    logger.info(
+        f"[PAPER] Order closed: {symbol} "
+        f"exit={exit_price:.2f} pnl={pnl:+.4f} ({pnl_pct:+.2%}) "
+        f"reason={reason}"
+    )
+    return {
+        "symbol":     symbol,
+        "side":       trade.side,   # captured before state is cleared
+        "exit_price": exit_price,
+        "pnl":        pnl,
+        "pnl_pct":    pnl_pct,
+        "reason":     reason,
+    }
+
+
+async def check_exits(current_prices: dict[str, float]) -> list[dict]:
     """
-    Reduce leverage automatically when balance drops below 80% of start.
-    Protects a small account from being wiped by a string of losses.
+    Checks all open paper trades against current prices.
+    Closes any that have hit TP or SL.
     """
-    if state.starting_balance == 0:
-        return original_leverage
+    closed = []
+    for symbol, trade in list(state.open_trades.items()):
+        price = current_prices.get(symbol)
+        if price is None:
+            continue
 
-    pct_remaining = balance / state.starting_balance
-    if pct_remaining < 0.80:
-        reduced = max(1, original_leverage - 2)
-        logger.warning(
-            f"Balance at {pct_remaining:.0%} of start — "
-            f"leverage auto-reduced to {reduced}x"
-        )
-        return reduced
-    return original_leverage
-
-
-def check_emergency_stop() -> tuple[bool, str]:
-    """
-    Hard stop conditions that trigger regardless of other guards.
-    Returns (should_stop, reason).
-    """
-    if state.drawdown_pct() >= TRADING.max_drawdown:
-        return True, (
-            f"EMERGENCY STOP: drawdown {state.drawdown_pct() * 100:.2f}% "
-            f">= {TRADING.max_drawdown * 100:.1f}%"
-        )
-    return False, ""
-
-
-def check_min_balance(balance: float, min_balance: float = 50.0) -> tuple[bool, str]:
-    if balance < min_balance:
-        return False, f"Balance ${balance:.2f} below minimum ${min_balance:.2f}"
-    return True, "OK"
+        if trade.side == "LONG":
+            if price >= trade.take_profit:
+                result = await close_order(symbol, trade.take_profit, "TP_HIT")
+                if result:
+                    closed.append(result)
+            elif price <= trade.stop_loss:
+                result = await close_order(symbol, trade.stop_loss, "SL_HIT")
+                if result:
+                    closed.append(result)
+        else:  # SHORT
+            if price <= trade.take_profit:
+                result = await close_order(symbol, trade.take_profit, "TP_HIT")
+                if result:
+                    closed.append(result)
+            elif price >= trade.stop_loss:
+                result = await close_order(symbol, trade.stop_loss, "SL_HIT")
+                if result:
+                    closed.append(result)
+    return closed

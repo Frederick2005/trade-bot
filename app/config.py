@@ -113,8 +113,8 @@ STRATEGY = StrategyConfig(
 
 
 # ── AI ────────────────────────────────────────────────────────────────────────
-
 class AIConfig(BaseModel):
+    model_config = {"protected_namespaces": ()}  # ← tells Pydantic to relax the restriction
     min_confidence: float
     min_trades_to_train: int
     retrain_every_days: int
@@ -157,4 +157,4 @@ def log_config() -> None:
     logger.info(f"  Signal TF   : {TIMEFRAMES.signal}  Trend TF: {TIMEFRAMES.trend}")
     logger.info(f"  AI min conf : {AI.min_confidence * 100:.0f}%")
     logger.info(f"  Telegram    : {'enabled' if TELEGRAM.enabled else 'disabled'}")
-    logger.info("=" * 40)
+    logger.info("=" * 40)   

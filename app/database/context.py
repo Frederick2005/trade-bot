@@ -69,12 +69,31 @@ async def save_training_label(
     pnl_pct: float,
 ) -> bool:
     try:
+        import json
+        import numpy as np
+
+        class _Encoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, np.integer):
+                    return int(obj)
+                if isinstance(obj, np.floating):
+                    return float(obj)
+                if isinstance(obj, np.bool_):
+                    return bool(obj)
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                return super().default(obj)
+
+        # Serialise to JSON string then back to plain Python dict
+        # This guarantees no numpy types reach Supabase
+        clean_features = json.loads(json.dumps(features, cls=_Encoder))
+
         client = get_client()
         client.table("training_labels").insert({
             "trade_id":   trade_id,
-            "features":   features,
-            "label":      label,
-            "pnl_pct":    pnl_pct,
+            "features":   clean_features,
+            "label":      int(label),
+            "pnl_pct":    float(pnl_pct),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
         logger.debug(f"Training label saved: trade_id={trade_id} label={label}")
