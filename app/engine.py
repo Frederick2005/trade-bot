@@ -84,12 +84,32 @@ class TradingEngine:
         # Start Telegram listener (non-blocking)
         asyncio.create_task(telegram.start_listener())
 
-        await telegram.send(
-            f"🚀 *Bot started*\n"
-            f"Mode: `{TRADING.mode.upper()}`\n"
-            f"Balance: `${state.balance:,.2f}`\n"
-            f"Symbols: `{', '.join(TRADING.symbols)}`"
-        )
+        # Only send startup message if this is a fresh start not a crash restart
+        import os, time, tempfile
+        last_start_file = os.path.join(tempfile.gettempdir(), "bot_last_start")
+        now = time.time()
+        send_startup_msg = True
+        if os.path.exists(last_start_file):
+            try:
+                with open(last_start_file) as _f:
+                    last = float(_f.read())
+                if now - last < 600:
+                    send_startup_msg = False
+            except Exception:
+                pass
+        try:
+            with open(last_start_file, "w") as _f:
+                _f.write(str(now))
+        except Exception:
+            pass
+
+        if send_startup_msg:
+            await telegram.send(
+                f"🚀 *Bot started*\n"
+                f"Mode: `{TRADING.mode.upper()}`\n"
+                f"Balance: `${state.balance:,.2f}`\n"
+                f"Symbols: `{', '.join(TRADING.symbols)}`"
+            )
 
         # Start Binance streams — blocks here until stopped
         await start_streams(on_candle_close=self._on_candle_close)
