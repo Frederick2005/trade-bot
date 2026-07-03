@@ -1,6 +1,13 @@
 from datetime import datetime
 
 
+def _safe_pct(numerator, denominator) -> float:
+    """Returns (numerator / denominator) * 100, or 0.0 if denominator is None/zero."""
+    if not denominator:
+        return 0.0
+    return (numerator - denominator) / denominator * 100
+
+
 def build_feature_vector(
     indicators_1h: dict,
     indicators_4h: dict,
@@ -24,20 +31,20 @@ def build_feature_vector(
 
     return {
         # ── Trend features ──────────────────────────────────────────
-        "ema_gap_pct_1h":    (ema50_1h - ema200_1h) / ema200_1h * 100,
-        "price_vs_ema50":    (price - ema50_1h) / ema50_1h * 100,
+        "ema_gap_pct_1h":    _safe_pct(ema50_1h, ema200_1h),
+        "price_vs_ema50":    _safe_pct(price, ema50_1h),
         "ema50_slope":       indicators_1h.get("ema50_slope", 0.0),
-        "trend_4h":          1.0 if ema50_4h > ema200_4h else -1.0,
-        "ema_gap_pct_4h":    (ema50_4h - ema200_4h) / ema200_4h * 100,
+        "trend_4h":          1.0 if (ema50_4h and ema200_4h and ema50_4h > ema200_4h) else -1.0,
+        "ema_gap_pct_4h":    _safe_pct(ema50_4h, ema200_4h),
 
         # ── Momentum features ───────────────────────────────────────
         "rsi_1h":            rsi_1h,
         "rsi_4h":            rsi_4h,
         "rsi_divergence":    rsi_1h - rsi_4h,
-        "rsi_vs_midpoint":   rsi_1h - 52.5,    # centre of our entry zone
+        "rsi_vs_midpoint":   rsi_1h - 52.5,
 
         # ── Volatility features ─────────────────────────────────────
-        "atr_pct":           atr_1h / price * 100,
+        "atr_pct":           (atr_1h / price * 100) if price else 0.0,
         "volatility_pct":    indicators_1h.get("volatility_pct", 0.0),
         "candle_body_pct":   indicators_1h.get("candle_body_pct", 0.0),
 
@@ -49,13 +56,13 @@ def build_feature_vector(
 
         # ── Time context ────────────────────────────────────────────
         "hour_utc":          float(candle_time.hour),
-        "day_of_week":       float(candle_time.weekday()),    # 0=Mon
+        "day_of_week":       float(candle_time.weekday()),
 
         # ── Recent bot performance ──────────────────────────────────
         "win_rate_recent":   recent_win_rate,
         "current_drawdown":  current_drawdown,
 
-        # ── Direction encoding (used by classifier) ─────────────────
+        # ── Direction encoding ──────────────────────────────────────
         "is_bullish_candle": 1.0 if indicators_1h.get("is_bullish_candle") else -1.0,
     }
 

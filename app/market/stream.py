@@ -8,27 +8,19 @@ from app.market import candles as candle_store
 from app.database.market import save_candles
 from app.state import state
 
-# Callback type: async fn(symbol, timeframe, candle) -> None
 OnCandleClose = Callable[[str, str, dict], Awaitable[None]]
 
-_reconnect_delay = 5   # seconds, doubles on each failure up to 60s
+_reconnect_delay = 5
 
 
 def _parse_kline(msg: dict) -> dict | None:
-    """
-    Parse a Binance kline WebSocket message.
-    Returns candle dict only on candle CLOSE (x=True).
-    Returns None for pings, heartbeats, or mid-candle updates.
-    """
-    # Silently ignore non-kline frames (pings, errors, subscribe confirms)
     if not isinstance(msg, dict):
         return None
     if msg.get("e") != "kline" and "k" not in msg:
         return None
-
     try:
         k = msg["k"]
-        if not k.get("x", False):   # x=True only on candle close
+        if not k.get("x", False):
             return None
         return {
             "open_time": datetime.fromtimestamp(
@@ -41,8 +33,27 @@ def _parse_kline(msg: dict) -> dict | None:
             "volume": k["v"],
         }
     except (KeyError, TypeError, ValueError):
-        # Not a candle frame — silently ignore
         return None
+
+
+async def _create_client() -> AsyncClient:
+    """Create Binance client with explicit testnet URLs to avoid geo-blocking."""
+    if BINANCE.testnet:
+        client = await AsyncClient.create(
+            api_key=BINANCE.api_key,
+            api_secret=BINANCE.api_secret,
+            testnet=True,
+            tld="com",
+        )
+        # Override to testnet endpoints explicitly
+        client.API_URL = "https://testnet.binancefuture.com/fapi/v1"
+        client.STREAM_URL = "wss://stream.binancefuture.com/ws"
+    else:
+        client = await AsyncClient.create(
+            api_key=BINANCE.api_key,
+            api_secret=BINANCE.api_secret,
+        )
+    return client
 
 
 async def _stream_symbol(
@@ -61,17 +72,9 @@ async def _stream_symbol(
             msg    = await s.recv()
             candle = _parse_kline(msg)
             if candle is None:
-                continue   # ping / mid-candle update — skip silently
-
-            # 1 — update in-memory buffer
+                continue
             candle_store.update(symbol, timeframe, candle)
-
-            # 2 — persist to Supabase (fire and forget)
-            asyncio.create_task(
-                save_candles(symbol, timeframe, [candle])
-            )
-
-            # 3 — call the engine callback
+            asyncio.create_task(save_candles(symbol, timeframe, [candle]))
             await on_close(symbol, timeframe, candle)
 
 
@@ -94,16 +97,12 @@ async def _stream_with_reconnect(
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
         else:
-            delay = _reconnect_delay   # reset on clean exit
+            delay = _reconnect_delay
 
 
 async def start_streams(on_candle_close: OnCandleClose) -> None:
     logger.info("Starting Binance WebSocket streams...")
-    client = await AsyncClient.create(
-        api_key=BINANCE.api_key,
-        api_secret=BINANCE.api_secret,
-        testnet=BINANCE.testnet,
-    )
+    client = await _create_client()
 
     tasks = []
     for symbol in TRADING.symbols:

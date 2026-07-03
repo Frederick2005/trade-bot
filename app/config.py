@@ -157,4 +157,4 @@ def log_config() -> None:
     logger.info(f"  Signal TF   : {TIMEFRAMES.signal}  Trend TF: {TIMEFRAMES.trend}")
     logger.info(f"  AI min conf : {AI.min_confidence * 100:.0f}%")
     logger.info(f"  Telegram    : {'enabled' if TELEGRAM.enabled else 'disabled'}")
-    logger.info("=" * 40)   
+    logger.info("=" * 40)

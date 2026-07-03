@@ -23,7 +23,6 @@ async def save_candles(symbol: str, timeframe: str, candles: list[dict]) -> bool
             }
             for c in candles
         ]
-        # upsert — safe to re-run, won't duplicate
         client.table("market_data").upsert(
             rows, on_conflict="symbol,timeframe,open_time"
         ).execute()
@@ -40,24 +39,47 @@ async def get_candles(
     limit: int = 300,
     since: Optional[datetime] = None,
 ) -> pd.DataFrame:
+    """
+    Fetch candles from Supabase, paginating past the default
+    PostgREST 1000-row cap so `limit` is honoured exactly.
+    """
     try:
         client = get_client()
-        query = (
-            client.table("market_data")
-            .select("open_time,open,high,low,close,volume")
-            .eq("symbol", symbol)
-            .eq("timeframe", timeframe)
-            .order("open_time", desc=True)
-            .limit(limit)
-        )
-        if since:
-            query = query.gte("open_time", since.isoformat())
+        page_size = 1000
+        all_rows: list[dict] = []
+        offset = 0
 
-        result = query.execute()
-        if not result.data:
+        while len(all_rows) < limit:
+            remaining = limit - len(all_rows)
+            fetch_size = min(page_size, remaining)
+
+            query = (
+                client.table("market_data")
+                .select("open_time,open,high,low,close,volume")
+                .eq("symbol", symbol)
+                .eq("timeframe", timeframe)
+                .order("open_time", desc=True)
+                .range(offset, offset + fetch_size - 1)
+            )
+            if since:
+                query = query.gte("open_time", since.isoformat())
+
+            result = query.execute()
+            batch = result.data or []
+
+            if not batch:
+                break
+
+            all_rows.extend(batch)
+            offset += fetch_size
+
+            if len(batch) < fetch_size:
+                break
+
+        if not all_rows:
             return pd.DataFrame()
 
-        df = pd.DataFrame(result.data)
+        df = pd.DataFrame(all_rows)
         df["open_time"] = pd.to_datetime(df["open_time"])
         df = df.sort_values("open_time").reset_index(drop=True)
         for col in ["open", "high", "low", "close", "volume"]:

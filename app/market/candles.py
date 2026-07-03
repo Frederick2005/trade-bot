@@ -1,4 +1,5 @@
 from collections import defaultdict
+import math
 import pandas as pd
 import ta
 from loguru import logger
@@ -8,7 +9,8 @@ from loguru import logger
 _candles: dict[tuple, pd.DataFrame] = defaultdict(pd.DataFrame)
 
 # Minimum candles needed before indicators are valid
-MIN_CANDLES = 100   # EMA200 needs 200 + a few warm-up bars
+# EMA200 needs at least 200 candles to produce a non-NaN value
+MIN_CANDLES = 200
 
 
 def update(symbol: str, timeframe: str, candle: dict) -> None:
@@ -57,6 +59,17 @@ def is_ready(symbol: str, timeframe: str) -> bool:
     return len(df) >= MIN_CANDLES
 
 
+def _safe(val, fallback: float = 0.0) -> float:
+    """Return fallback if val is NaN, inf, or None."""
+    if val is None:
+        return fallback
+    try:
+        f = float(val)
+        return fallback if (math.isnan(f) or math.isinf(f)) else f
+    except (TypeError, ValueError):
+        return fallback
+
+
 def get_indicators(symbol: str, timeframe: str) -> dict | None:
     df = get_df(symbol, timeframe)
     if len(df) < MIN_CANDLES:
@@ -85,42 +98,52 @@ def get_indicators(symbol: str, timeframe: str) -> dict | None:
         ).average_true_range()
 
         # Volume ratio vs 20-period average
-        vol_avg    = volume.rolling(20).mean()
-        vol_ratio  = (volume / vol_avg).iloc[-1]
+        vol_avg   = volume.rolling(20).mean()
+        vol_ratio = (volume / vol_avg).iloc[-1]
 
-        price      = close.iloc[-1]
-        ema50_val  = ema50.iloc[-1]
-        ema200_val = ema200.iloc[-1]
-        rsi_val    = rsi.iloc[-1]
-        atr_val    = atr.iloc[-1]
+        price      = _safe(close.iloc[-1])
+        ema50_val  = _safe(ema50.iloc[-1])
+        ema200_val = _safe(ema200.iloc[-1])
+        rsi_val    = _safe(rsi.iloc[-1], fallback=50.0)
+        atr_val    = _safe(atr.iloc[-1])
+        vol_ratio  = _safe(vol_ratio, fallback=1.0)
+
+        # Guard — if core values still came back zero after _safe, bail out
+        if not ema200_val or not ema50_val or not price:
+            logger.warning(
+                f"Core indicator values are zero/NaN for {symbol} {timeframe} "
+                f"— skipping (ema50={ema50_val} ema200={ema200_val} price={price})"
+            )
+            return None
 
         # Derived
-        price_vs_ema50  = (price - ema50_val) / ema50_val * 100
+        price_vs_ema50  = (price - ema50_val)  / ema50_val  * 100
         trend_strength  = (ema50_val - ema200_val) / ema200_val * 100
-        volatility_pct  = atr_val / price * 100
+        volatility_pct  = atr_val / price * 100 if price else 0.0
         ema_gap_pct     = (ema50_val - ema200_val) / ema200_val * 100
 
         last = df.iloc[-1]
         candle_range    = last["high"] - last["low"]
         candle_body     = abs(last["close"] - last["open"])
-        candle_body_pct = candle_body / candle_range if candle_range > 0 else 0
+        candle_body_pct = candle_body / candle_range if candle_range > 0 else 0.0
 
         # EMA slope (change over last 3 bars)
-        ema50_slope = (ema50_val - ema50.iloc[-4]) / ema50.iloc[-4] * 100
+        ema50_prev  = _safe(ema50.iloc[-4])
+        ema50_slope = (ema50_val - ema50_prev) / ema50_prev * 100 if ema50_prev else 0.0
 
         return {
-            "price":         price,
-            "ema50":         ema50_val,
-            "ema200":        ema200_val,
-            "rsi":           rsi_val,
-            "atr":           atr_val,
-            "volume_ratio":  vol_ratio,
-            "price_vs_ema50": price_vs_ema50,
-            "trend_strength": trend_strength,
-            "volatility_pct": volatility_pct,
-            "ema_gap_pct":   ema_gap_pct,
-            "candle_body_pct": candle_body_pct,
-            "ema50_slope":   ema50_slope,
+            "price":            price,
+            "ema50":            ema50_val,
+            "ema200":           ema200_val,
+            "rsi":              rsi_val,
+            "atr":              atr_val,
+            "volume_ratio":     vol_ratio,
+            "price_vs_ema50":   price_vs_ema50,
+            "trend_strength":   trend_strength,
+            "volatility_pct":   volatility_pct,
+            "ema_gap_pct":      ema_gap_pct,
+            "candle_body_pct":  candle_body_pct,
+            "ema50_slope":      ema50_slope,
             "is_bullish_candle": last["close"] > last["open"],
         }
 

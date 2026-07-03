@@ -1,7 +1,34 @@
+import math
 from datetime import datetime, timezone
 from typing import Optional
+
+import numpy as np
 from loguru import logger
+
 from app.database.client import get_client
+
+
+def _sanitize(v):
+    """Recursively convert any value to a JSON-safe Python scalar.
+    Replaces NaN / ±inf with None (JSON null).
+    """
+    if isinstance(v, np.bool_):
+        return bool(v)
+    if isinstance(v, np.integer):
+        return int(v)
+    if isinstance(v, np.ndarray):
+        return [_sanitize(x) for x in v.tolist()]
+    if isinstance(v, np.floating):
+        v = float(v)
+    if isinstance(v, float):
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    if isinstance(v, dict):
+        return {k: _sanitize(val) for k, val in v.items()}
+    if isinstance(v, list):
+        return [_sanitize(x) for x in v]
+    return v
 
 
 async def save_trade_context(trade_id: str, context: dict) -> bool:
@@ -69,31 +96,20 @@ async def save_training_label(
     pnl_pct: float,
 ) -> bool:
     try:
-        import json
-        import numpy as np
+        clean_features = _sanitize(features)
+        safe_pnl = None if (math.isnan(pnl_pct) or math.isinf(pnl_pct)) else float(pnl_pct)
 
-        class _Encoder(json.JSONEncoder):
-            def default(self, obj):
-                if isinstance(obj, np.integer):
-                    return int(obj)
-                if isinstance(obj, np.floating):
-                    return float(obj)
-                if isinstance(obj, np.bool_):
-                    return bool(obj)
-                if isinstance(obj, np.ndarray):
-                    return obj.tolist()
-                return super().default(obj)
-
-        # Serialise to JSON string then back to plain Python dict
-        # This guarantees no numpy types reach Supabase
-        clean_features = json.loads(json.dumps(features, cls=_Encoder))
+        # Log any features that were NaN/inf so you can trace the source
+        nulled = [k for k, v in clean_features.items() if v is None]
+        if nulled:
+            logger.warning(f"NaN/inf features replaced with null for trade_id={trade_id}: {nulled}")
 
         client = get_client()
         client.table("training_labels").insert({
             "trade_id":   trade_id,
             "features":   clean_features,
             "label":      int(label),
-            "pnl_pct":    float(pnl_pct),
+            "pnl_pct":    safe_pnl,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
         logger.debug(f"Training label saved: trade_id={trade_id} label={label}")
@@ -136,11 +152,9 @@ async def save_model_version(
 ) -> bool:
     try:
         client = get_client()
-        # deactivate all existing versions first
         client.table("model_versions").update(
             {"is_active": False}
         ).eq("is_active", True).execute()
-        # insert new active version
         client.table("model_versions").insert({
             "version":    version,
             "is_active":  True,
