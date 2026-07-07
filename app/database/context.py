@@ -62,6 +62,40 @@ async def save_trade_context(trade_id: str, context: dict) -> bool:
         return False
 
 
+async def save_signal_decision(symbol: str, decision) -> bool:
+    """
+    Logs EVERY decision_engine.evaluate_setup() call — accepted or rejected
+    — to the signal_decisions table (see migrations/002_signal_decisions.sql).
+    This is the AtlasQuant v2 spec's "every decision must be stored, even
+    rejected trades" requirement, and it's also what makes the quality-score
+    weights in app/strategy/quality_score.py actually tunable later: you
+    need the rejected setups' scores too, not just the accepted trades'
+    outcomes, to know whether the threshold is in the right place.
+    """
+    try:
+        client = get_client()
+        client.table("signal_decisions").insert({
+            "symbol":            symbol,
+            "accepted":          decision.accepted,
+            "side":              decision.side,
+            "regime":            decision.regime,
+            "structure":         decision.structure,
+            "entry_price":       decision.entry,
+            "stop_loss":         decision.stop_loss,
+            "take_profit":       decision.take_profit,
+            "quality_score":     decision.quality_score,
+            "quality_subscores": _sanitize(decision.quality_subscores) if decision.quality_subscores else None,
+            "raw_confidence":    decision.raw_confidence,
+            "rejection_reason":  decision.rejection_reason,
+            "reason":            decision.reason,
+            "created_at":        datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save signal decision: {e}")
+        return False
+
+
 async def log_decision(
     symbol: str,
     action: str,

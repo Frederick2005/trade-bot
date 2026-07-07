@@ -1,6 +1,7 @@
 """
-Download 2 years of 15m and 1h candle data from Binance.
+Download historical 15m and 1h candle data from Binance into Supabase.
 Usage: python scripts/seed_history.py
+       HISTORY_DAYS=1825 python scripts/seed_history.py   # 5 years (default)
 """
 import asyncio
 import sys
@@ -20,7 +21,7 @@ load_dotenv()
 BINANCE_BASE  = "https://api.binance.com"
 BATCH_SIZE    = 1000
 TIMEFRAMES    = ["15m", "1h"]
-HISTORY_DAYS  = 730  # 2 years
+HISTORY_DAYS  = int(os.getenv("HISTORY_DAYS", "1825"))  # 5 years by default
 
 
 def binance_tf_to_ms(timeframe: str) -> int:

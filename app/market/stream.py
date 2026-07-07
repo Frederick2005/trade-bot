@@ -104,9 +104,14 @@ async def start_streams(on_candle_close: OnCandleClose) -> None:
     logger.info("Starting Binance WebSocket streams...")
     client = await _create_client()
 
+    # 3-tier per AtlasQuant v2: primary (4H) is now also streamed, not just
+    # secondary/execution — the decision engine needs primary-timeframe
+    # indicators for Stage 1 (regime) and Stage 2 (HTF trend alignment).
+    timeframes = [TIMEFRAMES.execution, TIMEFRAMES.secondary, TIMEFRAMES.primary]
+
     tasks = []
     for symbol in TRADING.symbols:
-        for tf in [TIMEFRAMES.signal, TIMEFRAMES.trend]:
+        for tf in timeframes:
             tasks.append(
                 asyncio.create_task(
                     _stream_with_reconnect(client, symbol, tf, on_candle_close)
@@ -115,6 +120,6 @@ async def start_streams(on_candle_close: OnCandleClose) -> None:
 
     logger.info(
         f"Streaming {len(tasks)} feeds: "
-        f"{TRADING.symbols} × [{TIMEFRAMES.signal}, {TIMEFRAMES.trend}]"
+        f"{TRADING.symbols} × {timeframes}"
     )
     await asyncio.gather(*tasks)

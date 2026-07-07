@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Optional
+
+from app.config import DECISION_ENGINE
 
 
 @dataclass
@@ -32,6 +34,15 @@ class BotState:
     daily_trade_count: int           = 0
     daily_reset_date:  Optional[date] = None
 
+    # Losing-streak circuit breaker (AtlasQuant v2 spec: "Cooldown after
+    # consecutive losses" / originally the LTA Concepts "Two-Strike Rule").
+    # Threshold is configurable via MAX_LOSING_STREAK (DECISION_ENGINE.
+    # max_losing_streak, default 2) rather than hardcoded — this triggers
+    # on LOSS STREAK regardless of how small each loss was, which is a
+    # distinct control from the daily loss % limit below.
+    consecutive_losses:      int            = 0
+    losing_streak_until_date: Optional[date] = None
+
     # Control flags
     is_paused:   bool = False
     is_running:  bool = False
@@ -56,7 +67,22 @@ class BotState:
             return False, "Bot is paused"
         if self.open_trade_count() >= max_open:
             return False, f"Max open trades reached ({max_open})"
+        blocked, reason = self.losing_streak_blocked()
+        if blocked:
+            return False, reason
         return True, "OK"
+
+    def losing_streak_blocked(self) -> tuple[bool, str]:
+        """Blocked for the rest of the UTC day after
+        DECISION_ENGINE.max_losing_streak consecutive losses. Resets
+        automatically once that day has passed."""
+        today = datetime.now(timezone.utc).date()
+        if self.losing_streak_until_date is not None and today <= self.losing_streak_until_date:
+            return True, (
+                f"Losing-streak breaker: {self.consecutive_losses} consecutive losses — "
+                f"paused until {self.losing_streak_until_date.isoformat()} (UTC)"
+            )
+        return False, "OK"
 
     def record_closed_trade(self, pnl: float) -> None:
         self.daily_pnl        += pnl
@@ -65,6 +91,15 @@ class BotState:
         self.equity             = self.balance
         # Persist updated balance so next startup restores it
         _save_balance(self.balance)
+
+        if pnl < 0:
+            self.consecutive_losses += 1
+            if self.consecutive_losses >= DECISION_ENGINE.max_losing_streak:
+                today = datetime.now(timezone.utc).date()
+                self.losing_streak_until_date = today
+        else:
+            self.consecutive_losses = 0
+            self.losing_streak_until_date = None
 
     def drawdown_pct(self) -> float:
         if self.starting_balance == 0:

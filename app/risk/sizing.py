@@ -7,9 +7,17 @@ def calculate_lot_size(
     entry_price: float,
     stop_loss: float,
     leverage: int | None = None,
+    risk_multiplier: float = 1.0,
 ) -> tuple[float, float]:
     """
-    Returns (lot_size, notional_value) using 1% account risk per trade.
+    Returns (lot_size, notional_value) using TRADING.risk_per_trade account
+    risk per trade, scaled by risk_multiplier.
+
+    risk_multiplier: used by app/engine.py to halve risk on a trade that's
+    correlated with an already-open position (see app/risk/guards.py's
+    has_correlated_exposure() and TRADING.correlation_mode == "reduce_size").
+    Defaults to 1.0 — no behavior change unless a caller explicitly passes
+    something else.
 
     lot_size     = units of the asset to buy/sell
     notional     = lot_size × entry_price (total position value)
@@ -17,7 +25,7 @@ def calculate_lot_size(
     if leverage is None:
         leverage = TRADING.max_leverage
 
-    risk_amount   = balance * TRADING.risk_per_trade
+    risk_amount   = balance * TRADING.risk_per_trade * risk_multiplier
     stop_distance = abs(entry_price - stop_loss)
 
     if stop_distance == 0:

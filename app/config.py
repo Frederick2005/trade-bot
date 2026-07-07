@@ -72,6 +72,7 @@ class TradingConfig(BaseModel):
     daily_loss_limit: float
     max_drawdown: float
     max_open_trades: int
+    correlation_mode: str   # "block" | "allow" | "reduce_size" — see app/risk/guards.py
 
 TRADING = TradingConfig(
     mode=_optional("TRADING_MODE", "paper"),
@@ -81,18 +82,39 @@ TRADING = TradingConfig(
     daily_loss_limit=float(_optional("DAILY_LOSS_LIMIT", "0.03")),
     max_drawdown=float(_optional("MAX_DRAWDOWN", "0.10")),
     max_open_trades=int(_optional("MAX_OPEN_TRADES", "2")),
+    correlation_mode=_optional("CORRELATION_MODE", "reduce_size"),
 )
 
 
 # ── Timeframes ────────────────────────────────────────────────────────────────
+# 3-tier per the AtlasQuant v2 spec: Primary (4H) = main trend context,
+# Secondary (1H) = trend confirmation + market structure, Execution (15M) =
+# entry timing. `.signal` / `.trend` are kept as properties for backward
+# compatibility with app/strategy/ema_rsi.py, scripts/backtest.py, and
+# scripts/debug_strategy.py, which only know about a 2-tier signal/trend
+# split — they now map to execution/secondary respectively, so nothing
+# else needs to change to keep working.
 
 class TimeframeConfig(BaseModel):
-    signal: str
-    trend: str
+    primary:   str   # 4H  — main trend context (Stage 1/2)
+    secondary: str   # 1H  — trend confirmation + market structure (Stage 3)
+    execution: str   # 15M — entry timing (Stage 10)
+
+    @property
+    def signal(self) -> str:
+        return self.execution
+
+    @property
+    def trend(self) -> str:
+        return self.secondary
 
 TIMEFRAMES = TimeframeConfig(
-    signal=_optional("SIGNAL_TIMEFRAME", "1h"),
-    trend=_optional("TREND_TIMEFRAME", "4h"),
+    primary=_optional("PRIMARY_TIMEFRAME", "4h"),
+    # fall back to the old env var names so existing .env files (including
+    # ones scripts/backtest.py has already auto-written SIGNAL_TIMEFRAME /
+    # TREND_TIMEFRAME into) keep working without edits
+    secondary=_optional("SECONDARY_TIMEFRAME", _optional("TREND_TIMEFRAME", "1h")),
+    execution=_optional("EXECUTION_TIMEFRAME", _optional("SIGNAL_TIMEFRAME", "15m")),
 )
 
 
@@ -109,6 +131,24 @@ STRATEGY = StrategyConfig(
     rsi_upper=float(_optional("RSI_UPPER", "60")),
     atr_multiplier=float(_optional("ATR_MULTIPLIER", "1.5")),
     min_risk_reward=float(_optional("MIN_RISK_REWARD", "2.0")),
+)
+
+
+# ── Decision Engine (AtlasQuant v2 multi-stage pipeline) ───────────────────────
+# Every value here is a starting hypothesis, not a validated optimum — see
+# app/strategy/decision_engine.py's module docstring on why a higher
+# min_reward_ratio isn't automatically better. Sweep these against real
+# backtest data before trusting any specific number.
+
+class DecisionEngineConfig(BaseModel):
+    quality_threshold:   float   # 0-100, minimum score to accept a trade
+    min_reward_ratio:    float   # take-profit distance = stop distance * this
+    max_losing_streak:   int     # consecutive losses before pausing new entries
+
+DECISION_ENGINE = DecisionEngineConfig(
+    quality_threshold=float(_optional("QUALITY_SCORE_THRESHOLD", "80")),
+    min_reward_ratio=float(_optional("MIN_REWARD_RATIO", "3.0")),
+    max_losing_streak=int(_optional("MAX_LOSING_STREAK", "2")),
 )
 
 
@@ -154,7 +194,9 @@ def log_config() -> None:
     logger.info(f"  Max leverage: {TRADING.max_leverage}x")
     logger.info(f"  Daily limit : {TRADING.daily_loss_limit * 100:.1f}%")
     logger.info(f"  Max drawdown: {TRADING.max_drawdown * 100:.1f}%")
-    logger.info(f"  Signal TF   : {TIMEFRAMES.signal}  Trend TF: {TIMEFRAMES.trend}")
+    logger.info(f"  Timeframes  : primary={TIMEFRAMES.primary} secondary={TIMEFRAMES.secondary} execution={TIMEFRAMES.execution}")
+    logger.info(f"  Quality gate: {DECISION_ENGINE.quality_threshold}/100  Min R:R: {DECISION_ENGINE.min_reward_ratio}:1")
+    logger.info(f"  Loss streak : pause after {DECISION_ENGINE.max_losing_streak} consecutive losses")
     logger.info(f"  AI min conf : {AI.min_confidence * 100:.0f}%")
     logger.info(f"  Telegram    : {'enabled' if TELEGRAM.enabled else 'disabled'}")
     logger.info("=" * 40)

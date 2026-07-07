@@ -67,14 +67,51 @@ def _check_max_drawdown(symbol: str, side: str) -> tuple[bool, str]:
     return True, "OK"
 
 
-def _check_correlation(symbol: str, side: str) -> tuple[bool, str]:
+def has_correlated_exposure(symbol: str, side: str) -> bool:
+    """
+    True if a same-side trade is already open on a symbol correlated with
+    `symbol` (e.g. BTCUSDT LONG open while checking ETHUSDT LONG). Exposed
+    separately from _check_correlation so app/engine.py can use it to size
+    DOWN a correlated trade instead of blocking it outright, when
+    TRADING.correlation_mode == "reduce_size".
+    """
     for group in CORRELATED_PAIRS:
         if symbol not in group:
             continue
         for open_symbol, trade in state.open_trades.items():
-            if open_symbol in group and trade.side == side:
-                return False, (
-                    f"Correlated pair already open: "
-                    f"{open_symbol} {trade.side}"
-                )
+            if open_symbol in group and open_symbol != symbol and trade.side == side:
+                return True
+    return False
+
+
+def _check_correlation(symbol: str, side: str) -> tuple[bool, str]:
+    """
+    CORRELATION_MODE controls what happens when a same-side trade is
+    already open on a correlated symbol (BTC/ETH move together ~0.8-0.9
+    correlation historically — being LONG both at once is one concentrated
+    bet on "crypto goes up" split into two positions, not two independent
+    bets):
+
+      "block"       — the original behavior: reject the second trade outright.
+      "allow"       — let it through at full size. You get more trade
+                      frequency, but real risk during a correlated move is
+                      closer to 2x a single trade's risk, not two
+                      diversified 1% risks.
+      "reduce_size" — (default) let it through, but app/engine.py halves
+                      the position size for the correlated trade, so total
+                      correlated exposure stays capped near the original
+                      single-trade risk instead of stacking to 2x.
+    """
+    if TRADING.correlation_mode == "block":
+        for group in CORRELATED_PAIRS:
+            if symbol not in group:
+                continue
+            for open_symbol, trade in state.open_trades.items():
+                if open_symbol in group and open_symbol != symbol and trade.side == side:
+                    return False, f"Correlated pair already open: {open_symbol} {trade.side}"
+        return True, "OK"
+
+    # "allow" and "reduce_size" both let the trade through here — sizing
+    # adjustment for "reduce_size" happens in app/engine.py at position-size
+    # calculation time, not here (this function only gates yes/no).
     return True, "OK"

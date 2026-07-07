@@ -98,16 +98,81 @@ class TestRiskGuards:
         assert ok is False
         assert "Daily loss" in reason
 
-    def test_correlation_block(self):
+    def test_correlation_block_mode(self):
+        """CORRELATION_MODE='block' rejects a same-side trade on a
+        correlated symbol outright — this is the original behavior,
+        still available for anyone who wants it."""
         from app.state import OpenTrade
-        state.open_trades["BTCUSDT"] = OpenTrade(
-            trade_id="1", symbol="BTCUSDT", side="LONG",
-            entry_price=100, stop_loss=90, take_profit=120,
-            lot_size=0.1, opened_at="", strategy_version="v1.0"
+        from app.config import TRADING
+
+        original_mode = TRADING.correlation_mode
+        TRADING.correlation_mode = "block"
+        try:
+            state.open_trades["BTCUSDT"] = OpenTrade(
+                trade_id="1", symbol="BTCUSDT", side="LONG",
+                entry_price=100, stop_loss=90, take_profit=120,
+                lot_size=0.1, opened_at="", strategy_version="v1.0"
+            )
+            ok, reason = check_all("ETHUSDT", "LONG")
+            assert ok is False
+            assert "Correlated" in reason
+        finally:
+            TRADING.correlation_mode = original_mode
+
+    def test_correlation_reduce_size_mode_allows_trade(self):
+        """CORRELATION_MODE='reduce_size' (the default) lets the trade
+        through — app/engine.py is responsible for halving position size,
+        not this guard. See test_correlation_reduce_size_flags_exposure
+        for the exposure-detection half of this."""
+        from app.state import OpenTrade
+        from app.config import TRADING
+
+        original_mode = TRADING.correlation_mode
+        TRADING.correlation_mode = "reduce_size"
+        try:
+            state.open_trades["BTCUSDT"] = OpenTrade(
+                trade_id="1", symbol="BTCUSDT", side="LONG",
+                entry_price=100, stop_loss=90, take_profit=120,
+                lot_size=0.1, opened_at="", strategy_version="v1.0"
+            )
+            ok, reason = check_all("ETHUSDT", "LONG")
+            assert ok is True
+        finally:
+            TRADING.correlation_mode = original_mode
+
+    def test_correlation_reduce_size_flags_exposure(self):
+        """has_correlated_exposure() correctly detects same-side correlated
+        exposure (for engine.py's sizing step) and correctly does NOT flag
+        opposite-side trades on a correlated symbol as exposure."""
+        from app.state import OpenTrade
+        from app.risk.guards import has_correlated_exposure
+
+        state.open_trades["ETHUSDT"] = OpenTrade(
+            trade_id="1", symbol="ETHUSDT", side="LONG",
+            entry_price=3000, stop_loss=2900, take_profit=3200,
+            lot_size=1.0, opened_at="", strategy_version="v1.0"
         )
-        ok, reason = check_all("ETHUSDT", "LONG")
-        assert ok is False
-        assert "Correlated" in reason
+        assert has_correlated_exposure("BTCUSDT", "LONG") is True
+        assert has_correlated_exposure("BTCUSDT", "SHORT") is False
+
+    def test_correlation_allow_mode(self):
+        """CORRELATION_MODE='allow' lets the trade through at full size —
+        no exposure flag needed since engine.py won't check it in this mode."""
+        from app.state import OpenTrade
+        from app.config import TRADING
+
+        original_mode = TRADING.correlation_mode
+        TRADING.correlation_mode = "allow"
+        try:
+            state.open_trades["BTCUSDT"] = OpenTrade(
+                trade_id="1", symbol="BTCUSDT", side="LONG",
+                entry_price=100, stop_loss=90, take_profit=120,
+                lot_size=0.1, opened_at="", strategy_version="v1.0"
+            )
+            ok, reason = check_all("ETHUSDT", "LONG")
+            assert ok is True
+        finally:
+            TRADING.correlation_mode = original_mode
 
     def test_clean_state_allows_trade(self):
         ok, reason = check_all("BTCUSDT", "LONG")

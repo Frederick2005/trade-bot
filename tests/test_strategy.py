@@ -24,12 +24,16 @@ def _make_indicators(
     }
 
 
-def _make_4h_bull() -> dict:
-    return _make_indicators(ema50=105.0, ema200=100.0)
+def _make_4h_bull(body_pct=0.85) -> dict:
+    # body_pct defaults to 0.85 (was implicitly 0.7 via _make_indicators'
+    # own default) — must be >= TREND_CANDLE_MIN_BODY_PCT (0.8) for tests
+    # that expect a valid signal, since evaluate_entry() now gates on the
+    # TREND-timeframe candle's body strength too (see signal_logic.py).
+    return _make_indicators(ema50=105.0, ema200=100.0, body_pct=body_pct)
 
 
-def _make_4h_bear() -> dict:
-    return _make_indicators(ema50=95.0, ema200=100.0)
+def _make_4h_bear(body_pct=0.85) -> dict:
+    return _make_indicators(ema50=95.0, ema200=100.0, body_pct=body_pct)
 
 
 class TestLongSignal:
@@ -67,6 +71,16 @@ class TestLongSignal:
     def test_no_signal_price_far_from_ema50(self, strategy):
         ind_1h = _make_indicators(price_vs_ema50=3.0)
         ind_4h = _make_4h_bull()
+        signal = strategy.evaluate("BTCUSDT", ind_1h, ind_4h)
+        assert signal is None
+
+    def test_no_signal_weak_trend_candle(self, strategy):
+        # Trend-timeframe candle body below TREND_CANDLE_MIN_BODY_PCT (0.8)
+        # should block the signal even though everything else is valid —
+        # this is the gate added from real backtest evidence (see
+        # signal_logic.py's TREND_CANDLE_MIN_BODY_PCT comment).
+        ind_1h = _make_indicators()
+        ind_4h = _make_4h_bull(body_pct=0.5)
         signal = strategy.evaluate("BTCUSDT", ind_1h, ind_4h)
         assert signal is None
 

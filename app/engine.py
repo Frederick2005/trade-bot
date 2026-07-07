@@ -9,19 +9,21 @@ import asyncio
 from datetime import datetime, timezone
 from loguru import logger
 
-from app.config import TRADING, TIMEFRAMES, AI, log_config
+from app.config import TRADING, TIMEFRAMES, AI, DECISION_ENGINE, log_config
 from app.state import state
 from app.market import candles as candle_store
 from app.market.stream import start_streams
 from app.strategy.ema_rsi import EmaRsiStrategy
+from app.strategy.base import Signal
+from app.strategy import decision_engine
 from app.strategy.params import get_active_params
-from app.risk.guards import check_all
+from app.risk.guards import check_all, has_correlated_exposure
 from app.risk.limits import check_emergency_stop, auto_reduce_leverage
 from app.risk.sizing import calculate_lot_size
 from app.database.client import check_connection
 from app.database.trades import save_trade, close_trade, get_open_trades, count_closed_trades
 from app.database.market import get_candles
-from app.database.context import save_trade_context, log_decision, log_bot_event
+from app.database.context import save_trade_context, log_decision, log_bot_event, save_signal_decision
 from app.learning.engine import on_trade_closed
 from app.notifications import telegram
 from app.notifications.messages import (
@@ -33,10 +35,22 @@ from app.notifications.messages import (
 )
 from app.ai.features import build_feature_vector
 import app.ai.model as ai_model
+from app.strategy.signal_logic import ATR_MULTIPLIER as STOP_ATR_MULTIPLIER
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-MAX_OPEN_TRADES    = 10     # maximum concurrent positions across all symbols
-BREAKEVEN_ATR_MULT = 1.0    # move SL to breakeven after price moves +1×ATR
+# MAX_OPEN_TRADES was previously hardcoded to 10 here, completely ignoring
+# TRADING.max_open_trades from app/config.py (which reads your .env
+# MAX_OPEN_TRADES setting, default 2). That meant changing MAX_OPEN_TRADES in
+# .env had zero effect on the live bot. Now sourced from config directly, see
+# usages below (kept as a property so it always reflects current config).
+#
+# BREAKEVEN_ATR_MULT was 1.0, meaning breakeven triggered before the stop-loss
+# distance was even covered (stop = 1.5×ATR per signal_logic.ATR_MULTIPLIER).
+# LTA Concepts Ch. 35 is explicit: move to breakeven "once a trade reaches
+# 1R" — i.e. once profit covers the ORIGINAL STOP DISTANCE, not some smaller
+# fixed ATR multiple. Set to match the actual stop distance so breakeven
+# really is "at 1R".
+BREAKEVEN_ATR_MULT = STOP_ATR_MULTIPLIER   # = 1R, matches the actual stop distance
 TRAILING_ATR_MULT  = 1.5    # trail SL at 1.5×ATR behind price after breakeven
 
 
@@ -82,7 +96,7 @@ class TradingEngine:
     async def start(self) -> None:
         log_config()
         logger.info(f"Starting engine in {TRADING.mode.upper()} mode")
-        logger.info(f"Max concurrent trades: {MAX_OPEN_TRADES}")
+        logger.info(f"Max concurrent trades: {TRADING.max_open_trades}")
 
         state.supabase_connected = check_connection()
         if not state.supabase_connected:
@@ -142,7 +156,7 @@ class TradingEngine:
                 f"Mode: `{TRADING.mode.upper()}`\n"
                 f"Balance: `${state.balance:,.2f}`\n"
                 f"Symbols: `{', '.join(TRADING.symbols)}`\n"
-                f"Max trades: `{MAX_OPEN_TRADES}`\n"
+                f"Max trades: `{TRADING.max_open_trades}`\n"
                 f"Timeframes: `{TIMEFRAMES.signal}/{TIMEFRAMES.trend}`"
             )
 
@@ -190,22 +204,33 @@ class TradingEngine:
     ) -> None:
         """
         For each open trade on this symbol:
-        1. Once profit >= 1×ATR → move SL to breakeven (entry price)
-        2. After breakeven → trail SL at 1.5×ATR below highest price seen
+        1. Once profit >= 1R (stop distance) → move SL to breakeven (entry price)
+        2. After breakeven → trail SL at 1.5×ATR behind the most favorable
+           price seen
+
+        Handles LONG and SHORT symmetrically. Previously this method had
+        `if trade.side != "LONG": continue` at the top — SHORT trades got
+        no breakeven or trailing-stop protection at all. That combined with
+        the engine.py argument-swap bug elsewhere meant SHORT signals may
+        rarely have fired before, so this gap likely went unnoticed; now
+        that SHORT signals fire correctly, this matters.
         """
         for trade_id, trade in list(self.active_trades.items()):
             if trade.symbol != symbol:
                 continue
-            if trade.side != "LONG":
-                continue
 
-            profit_dist = current_price - trade.entry_price
+            is_long = trade.side == "LONG"
+            profit_dist = (
+                (current_price - trade.entry_price) if is_long
+                else (trade.entry_price - current_price)
+            )
 
-            # Step 1 — breakeven
+            # Step 1 — breakeven at 1R
             if not trade.breakeven_hit:
                 if profit_dist >= trade.atr * BREAKEVEN_ATR_MULT:
-                    new_sl = trade.entry_price  # move to entry
-                    if new_sl > trade.stop_loss:
+                    new_sl = trade.entry_price
+                    improves = (new_sl > trade.stop_loss) if is_long else (new_sl < trade.stop_loss)
+                    if improves:
                         trade.stop_loss    = new_sl
                         trade.breakeven_hit = True
                         logger.info(
@@ -215,51 +240,121 @@ class TradingEngine:
 
             # Step 2 — trailing stop
             if trade.breakeven_hit:
-                if current_price > trade.highest_price:
-                    trade.highest_price = current_price
-
-                trailing_sl = trade.highest_price - (trade.atr * TRAILING_ATR_MULT)
-                if trailing_sl > trade.stop_loss:
-                    trade.stop_loss = trailing_sl
-                    logger.debug(
-                        f"Trailing stop updated: {symbol} "
-                        f"trade={trade_id[:8]} SL={trailing_sl:.2f}"
-                    )
+                if is_long:
+                    if current_price > trade.highest_price:
+                        trade.highest_price = current_price
+                    trailing_sl = trade.highest_price - (trade.atr * TRAILING_ATR_MULT)
+                    if trailing_sl > trade.stop_loss:
+                        trade.stop_loss = trailing_sl
+                        logger.debug(
+                            f"Trailing stop updated: {symbol} "
+                            f"trade={trade_id[:8]} SL={trailing_sl:.2f}"
+                        )
+                else:
+                    if current_price < trade.highest_price:
+                        trade.highest_price = current_price
+                    trailing_sl = trade.highest_price + (trade.atr * TRAILING_ATR_MULT)
+                    if trailing_sl < trade.stop_loss:
+                        trade.stop_loss = trailing_sl
+                        logger.debug(
+                            f"Trailing stop updated: {symbol} "
+                            f"trade={trade_id[:8]} SL={trailing_sl:.2f}"
+                        )
 
     # ── Signal evaluation ─────────────────────────────────────────────────────
 
     async def _evaluate_signal(self, symbol: str) -> None:
-        # Check global trade cap
-        if len(self.active_trades) >= MAX_OPEN_TRADES:
-            logger.debug(f"Max trades ({MAX_OPEN_TRADES}) reached — skipping {symbol}")
+        # Check global trade cap, pause state, and the losing-streak breaker
+        # (configurable via MAX_LOSING_STREAK, generalized from the old
+        # fixed Two-Strike Rule). state.can_trade() existed before this fix
+        # but was never actually called anywhere in the engine — max_open
+        # was checked separately below, and is_paused / streak blocking had no
+        # effect on whether new trades opened at all.
+        can_trade, block_reason = state.can_trade(TRADING.max_open_trades)
+        if not can_trade:
+            logger.debug(f"Skipping {symbol}: {block_reason}")
             return
 
-        ind_signal = candle_store.get_indicators(symbol, TIMEFRAMES.signal)
-        ind_trend  = candle_store.get_indicators(symbol, TIMEFRAMES.trend)
-
-        if ind_signal is None or ind_trend is None:
+        # Prevent multiple concurrent trades on the SAME symbol. This guard
+        # was missing entirely — self.active_trades is keyed by trade_id and
+        # would happily track two simultaneous positions on one symbol, but
+        # app/state.py's state.open_trades is keyed by SYMBOL (see
+        # app/execution/binance.py / paper.py: `state.open_trades[symbol] =
+        # trade`). A second trade on the same symbol would silently
+        # overwrite the first one's entry in state.open_trades, corrupting
+        # the per-symbol checks in app/risk/guards.py and Telegram
+        # notifications for whichever trade got overwritten. One trade per
+        # symbol at a time is also just the saner default for a bot that
+        # now fires both LONG and SHORT signals.
+        if any(t.symbol == symbol for t in self.active_trades.values()):
+            logger.debug(f"Skipping {symbol}: trade already open on this symbol")
             return
 
-        # Strategy expects (symbol, ind_signal, ind_trend)
-        # ema_rsi.py uses ind_4h as signal and ind_1h as trend
-        # so pass (symbol, ind_trend, ind_signal) to match parameter names
-        signal = self.strategy.evaluate(symbol, ind_trend, ind_signal)
+        ind_execution = candle_store.get_indicators(symbol, TIMEFRAMES.execution)
+        ind_secondary = candle_store.get_indicators(symbol, TIMEFRAMES.secondary)
+        ind_primary   = candle_store.get_indicators(symbol, TIMEFRAMES.primary)
 
-        if signal is None:
+        if ind_execution is None or ind_secondary is None or ind_primary is None:
+            return
+
+        df_execution = candle_store.get_df(symbol, TIMEFRAMES.execution)
+        df_secondary = candle_store.get_df(symbol, TIMEFRAMES.secondary)
+        df_primary   = candle_store.get_df(symbol, TIMEFRAMES.primary)
+
+        # Full multi-stage pipeline (regime -> trend -> structure -> quality
+        # score -> dynamic stop/target), replacing the old direct call to
+        # self.strategy.evaluate(). signal_logic.evaluate_entry() (used
+        # inside EmaRsiStrategy) is still the base technical trigger this
+        # wraps — decision_engine doesn't duplicate that logic, it adds the
+        # regime gate, 3-timeframe alignment, market structure, and the
+        # 0-100 quality score gate on top of it.
+        decision = decision_engine.evaluate_setup(
+            df_execution=df_execution,
+            df_secondary=df_secondary,
+            df_primary=df_primary,
+            ind_execution=ind_execution,
+            ind_secondary=ind_secondary,
+            ind_primary=ind_primary,
+            quality_threshold=DECISION_ENGINE.quality_threshold,
+            min_reward_ratio=DECISION_ENGINE.min_reward_ratio,
+        )
+
+        await save_signal_decision(symbol=symbol, decision=decision)
+
+        if not decision.accepted:
             await log_decision(
                 symbol=symbol,
                 action="SKIPPED",
-                reason="No signal",
-                rsi=ind_signal.get("rsi"),
-                atr=ind_signal.get("atr"),
+                reason=decision.rejection_reason or "Setup rejected",
+                signal_type=decision.side,
+                rsi=ind_execution.get("rsi"),
+                atr=ind_execution.get("atr"),
+                confidence=(decision.quality_score or 0),
             )
             return
+
+        signal = Signal(
+            symbol=symbol,
+            side=decision.side,
+            entry_price=decision.entry,
+            stop_loss=decision.stop_loss,
+            take_profit=decision.take_profit,
+            confidence=(decision.quality_score or 0) / 100.0,
+            reason=decision.reason or "",
+            indicators={
+                **ind_execution,
+                "regime": decision.regime,
+                "structure": decision.structure,
+                "quality_score": decision.quality_score,
+                "quality_subscores": decision.quality_subscores,
+            },
+        )
 
         # ── AI confidence filter ───────────────────────────────────
         confidence  = signal.confidence
         if ai_model.is_loaded():
             features = build_feature_vector(
-                ind_trend, ind_signal,
+                ind_execution, ind_secondary,
                 candle_time=datetime.now(timezone.utc),
                 recent_win_rate=0.5,
                 current_drawdown=state.drawdown_pct(),
@@ -272,7 +367,7 @@ class TradingEngine:
                     action="SKIPPED",
                     reason=f"AI conf {ai_conf:.2%} < {AI.min_confidence:.2%}",
                     signal_type=signal.side,
-                    rsi=ind_signal.get("rsi"),
+                    rsi=ind_execution.get("rsi"),
                     confidence=ai_conf * 100,
                 )
                 return
@@ -282,18 +377,31 @@ class TradingEngine:
         if not allowed:
             await log_decision(
                 symbol=symbol, action="BLOCKED", reason=reason,
-                signal_type=signal.side, rsi=ind_signal.get("rsi"),
+                signal_type=signal.side, rsi=ind_execution.get("rsi"),
                 confidence=confidence * 100,
             )
             return
 
         # ── Position sizing ────────────────────────────────────────
+        # If a same-side trade is already open on a correlated symbol
+        # (see app/risk/guards.py) and CORRELATION_MODE=reduce_size, halve
+        # risk on this trade instead of either blocking it outright or
+        # letting total correlated exposure silently double.
+        risk_multiplier = 1.0
+        if TRADING.correlation_mode == "reduce_size" and has_correlated_exposure(symbol, signal.side):
+            risk_multiplier = 0.5
+            logger.info(
+                f"Correlated exposure detected for {symbol} {signal.side} — "
+                f"sizing at {risk_multiplier}x normal risk"
+            )
+
         leverage = auto_reduce_leverage(state.balance, TRADING.max_leverage)
         lot_size, notional = calculate_lot_size(
             balance=state.balance,
             entry_price=signal.entry_price,
             stop_loss=signal.stop_loss,
             leverage=leverage,
+            risk_multiplier=risk_multiplier,
         )
         if lot_size == 0:
             await log_decision(symbol, "BLOCKED", "Position too small")
@@ -319,7 +427,7 @@ class TradingEngine:
 
         if trade_id:
             # Track in active trades with ATR for trailing stop
-            atr = ind_signal.get("atr", 0.0)
+            atr = ind_execution.get("atr", 0.0)
             self.active_trades[trade_id] = ActiveTrade(
                 trade_id=trade_id,
                 symbol=symbol,
@@ -342,15 +450,15 @@ class TradingEngine:
             await save_trade_context(trade_id, ctx)
             await log_decision(
                 symbol=symbol, action="ENTERED", reason=signal.reason,
-                signal_type=signal.side, rsi=ind_signal.get("rsi"),
-                atr=ind_signal.get("atr"), confidence=confidence * 100,
+                signal_type=signal.side, rsi=ind_execution.get("rsi"),
+                atr=ind_execution.get("atr"), confidence=confidence * 100,
             )
 
             logger.info(
                 f"Trade opened: {symbol} {signal.side} | "
                 f"entry={signal.entry_price:.2f} SL={signal.stop_loss:.2f} "
                 f"TP={signal.take_profit:.2f} | "
-                f"Active trades: {len(self.active_trades)}/{MAX_OPEN_TRADES}"
+                f"Active trades: {len(self.active_trades)}/{TRADING.max_open_trades}"
             )
 
         await telegram.send(
@@ -420,7 +528,7 @@ class TradingEngine:
                 f"Trade closed: {sym} {side} | "
                 f"exit={result['exit_price']:.2f} "
                 f"pnl={result['pnl']:+.2f} ({result['reason']}) | "
-                f"Active trades: {len(self.active_trades)}/{MAX_OPEN_TRADES}"
+                f"Active trades: {len(self.active_trades)}/{TRADING.max_open_trades}"
             )
 
             await telegram.send(
@@ -485,8 +593,11 @@ class TradingEngine:
 
     async def _seed_candles(self) -> None:
         for symbol in TRADING.symbols:
-            for tf in [TIMEFRAMES.signal, TIMEFRAMES.trend]:
-                df = await get_candles(symbol, tf, limit=500)
+            for tf in [TIMEFRAMES.execution, TIMEFRAMES.secondary, TIMEFRAMES.primary]:
+                # Primary (4H) needs more history for market_structure's
+                # swing detection to have enough confirmed swings.
+                limit = 500 if tf != TIMEFRAMES.primary else 300
+                df = await get_candles(symbol, tf, limit=limit)
                 if not df.empty:
                     candle_store.seed(symbol, tf, df)
                 else:

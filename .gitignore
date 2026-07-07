@@ -36,3 +36,4 @@ backtest_results/
 *.egg-info/
 dist/
 build/
+data_cache/
