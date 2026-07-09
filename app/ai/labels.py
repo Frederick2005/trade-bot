@@ -44,13 +44,24 @@ async def get_all_labels() -> tuple[list[list[float]], list[int]]:
 
     try:
         client = get_client()
-        result = (
-            client.table("training_labels")
-            .select("features,label")
-            .order("created_at")
-            .execute()
-        )
-        data = result.data or []
+        all_data = []
+        batch_size = 1000
+        offset = 0
+        while True:
+            result = (
+                client.table("training_labels")
+                .select("features,label")
+                .order("created_at")
+                .range(offset, offset + batch_size - 1)
+                .execute()
+            )
+            batch = result.data or []
+            all_data.extend(batch)
+            if len(batch) < batch_size:
+                break
+            offset += batch_size
+            logger.info(f"Loaded {len(all_data)} labels so far...")
+        data = all_data
 
         if not data:
             logger.warning("No training labels found in database")

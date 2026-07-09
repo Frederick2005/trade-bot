@@ -20,7 +20,7 @@ load_dotenv()
 
 BINANCE_BASE  = "https://api.binance.com"
 BATCH_SIZE    = 1000
-TIMEFRAMES    = ["15m", "1h"]
+TIMEFRAMES    = ["1d", "4h"]
 HISTORY_DAYS  = int(os.getenv("HISTORY_DAYS", "1825"))  # 5 years by default
 
 

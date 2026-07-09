@@ -11,12 +11,13 @@ This is now a thin wrapper around app.strategy.signal_logic, which is the
 single shared source of truth for entry logic (also used directly by
 scripts/backtest.py). Live and backtest can no longer drift apart.
 """
+from calendar import weekday
 from typing import Optional
 
 from app.strategy.base import BaseStrategy, Signal
 from app.strategy import signal_logic
 
-
+ 
 class EmaRsiStrategy(BaseStrategy):
     def evaluate(
         self,
@@ -49,3 +50,13 @@ class EmaRsiStrategy(BaseStrategy):
                 "trend_ema200": indicators_4h.get("ema200"),
             },
         )
+def evaluate(self, symbol, indicators_1h, indicators_4h):
+    from datetime import datetime, timezone
+    hour = datetime.now(timezone.utc).hour
+    # Only trade NY session — your best performing window
+    if not (14 <= hour <= 19):
+        return None
+    # rest of strategy...
+    weekday = datetime.now(timezone.utc).weekday()
+    if weekday == 5:  # Saturday = 5
+        return None

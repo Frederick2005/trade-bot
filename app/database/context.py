@@ -152,17 +152,31 @@ async def save_training_label(
         logger.error(f"Failed to save training label: {e}")
         return False
 
-
 async def get_training_labels(min_count: int = 0) -> list[dict]:
     try:
         client = get_client()
-        result = (
-            client.table("training_labels")
-            .select("features,label,pnl_pct,created_at")
-            .order("created_at")
-            .execute()
-        )
-        data = result.data or []
+        all_data = []
+        batch_size = 1000
+        offset = 0
+
+        while True:
+            result = (
+                client.table("training_labels")
+                .select("features,label,pnl_pct,created_at")
+                .order("created_at")
+                .range(offset, offset + batch_size - 1)
+                .execute()
+            )
+            batch = result.data or []
+            all_data.extend(batch)
+            if len(batch) < batch_size:
+                break
+            offset += batch_size
+            logger.info(f"Fetched {len(all_data)} training labels so far...")
+
+        result_data = all_data
+        
+        data = result_data
         if len(data) < min_count:
             logger.warning(
                 f"Only {len(data)} training labels available, need {min_count}"
