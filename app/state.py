@@ -29,10 +29,11 @@ class BotState:
     # Open positions — keyed by symbol
     open_trades: dict[str, OpenTrade] = field(default_factory=dict)
 
-    # Daily loss tracking — resets at midnight UTC
+    # Daily loss/profit tracking — resets at midnight UTC
     daily_pnl:         float         = 0.0
     daily_trade_count: int           = 0
     daily_reset_date:  Optional[date] = None
+    daily_target_hit:  bool          = False   # profit lock-in flag (see below)
 
     # Losing-streak circuit breaker (AtlasQuant v2 spec: "Cooldown after
     # consecutive losses" / originally the LTA Concepts "Two-Strike Rule").
@@ -67,6 +68,11 @@ class BotState:
             return False, "Bot is paused"
         if self.open_trade_count() >= max_open:
             return False, f"Max open trades reached ({max_open})"
+        if self.daily_target_hit:
+            return False, (
+                f"Daily profit target reached ({DECISION_ENGINE.daily_profit_target_pct:.1%}) "
+                f"— locking in today's gains, no new trades until UTC midnight"
+            )
         blocked, reason = self.losing_streak_blocked()
         if blocked:
             return False, reason
@@ -84,13 +90,35 @@ class BotState:
             )
         return False, "OK"
 
+    def check_daily_reset(self) -> None:
+        """Call at the start of every evaluation loop — resets daily
+        counters (including the profit-target lock-in) at UTC midnight."""
+        today = datetime.now(timezone.utc).date()
+        if self.daily_reset_date is not None and today != self.daily_reset_date:
+            self.daily_pnl = 0.0
+            self.daily_trade_count = 0
+            self.daily_target_hit = False
+        self.daily_reset_date = today
+
     def record_closed_trade(self, pnl: float) -> None:
+        self.check_daily_reset()
         self.daily_pnl        += pnl
         self.daily_trade_count += 1
         self.balance           += pnl
         self.equity             = self.balance
         # Persist updated balance so next startup restores it
         _save_balance(self.balance)
+
+        # Daily profit target lock-in: once today's gains hit the target,
+        # stop opening new trades for the rest of the UTC day. This is the
+        # mirror of the daily loss limit — protects a good day's gains
+        # from being given back by continuing to trade after the edge has
+        # already paid out for today.
+        if self.balance > 0:
+            daily_pnl_pct = self.daily_pnl / max(self.balance - self.daily_pnl, 1e-9)
+            if daily_pnl_pct >= DECISION_ENGINE.daily_profit_target_pct:
+                if not self.daily_target_hit:
+                    self.daily_target_hit = True
 
         if pnl < 0:
             self.consecutive_losses += 1

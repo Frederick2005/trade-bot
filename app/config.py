@@ -73,6 +73,7 @@ class TradingConfig(BaseModel):
     max_drawdown: float
     max_open_trades: int
     correlation_mode: str   # "block" | "allow" | "reduce_size" — see app/risk/guards.py
+    max_funding_rate: float # skip entries when |funding rate| exceeds this (futures only)
 
 TRADING = TradingConfig(
     mode=_optional("TRADING_MODE", "paper"),
@@ -83,6 +84,7 @@ TRADING = TradingConfig(
     max_drawdown=float(_optional("MAX_DRAWDOWN", "0.10")),
     max_open_trades=int(_optional("MAX_OPEN_TRADES", "2")),
     correlation_mode=_optional("CORRELATION_MODE", "reduce_size"),
+    max_funding_rate=float(_optional("MAX_FUNDING_RATE", "0.001")),  # 0.1% per 8h
 )
 
 
@@ -144,11 +146,15 @@ class DecisionEngineConfig(BaseModel):
     quality_threshold:   float   # 0-100, minimum score to accept a trade
     min_reward_ratio:    float   # take-profit distance = stop distance * this
     max_losing_streak:   int     # consecutive losses before pausing new entries
+    max_hold_hours:       float   # force-close a trade still open after this long
+    daily_profit_target_pct: float  # stop opening new trades once daily gain hits this
 
 DECISION_ENGINE = DecisionEngineConfig(
     quality_threshold=float(_optional("QUALITY_SCORE_THRESHOLD", "80")),
     min_reward_ratio=float(_optional("MIN_REWARD_RATIO", "3.0")),
     max_losing_streak=int(_optional("MAX_LOSING_STREAK", "2")),
+    max_hold_hours=float(_optional("MAX_HOLD_HOURS", "168")),          # 7 days
+    daily_profit_target_pct=float(_optional("DAILY_PROFIT_TARGET_PCT", "0.15")),  # 15%
 )
 
 

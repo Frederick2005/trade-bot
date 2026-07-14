@@ -49,7 +49,7 @@ import ta
 from loguru import logger
 from dotenv import load_dotenv, set_key
 
-from app.config import TRADING
+from app.config import TRADING, DECISION_ENGINE
 from app.database.market import get_candles
 from app.database.context import save_training_label
 from app.ai.features import build_feature_vector
@@ -88,6 +88,8 @@ MIN_TRADES       = 30
 # dataset". Use "compounding" to answer "would a real account survive this".
 # They answer different questions — neither is more "correct" in isolation.
 SIZING_MODE = os.getenv("BACKTEST_SIZING_MODE", "fixed")
+
+MAX_HOLD_HOURS = DECISION_ENGINE.max_hold_hours  # default 168 = 7 days
 
 YEARS            = float(os.getenv("BACKTEST_YEARS", "5"))
 CANDLES_PER_DAY  = {"15m": 96, "1h": 24, "4h": 6, "1d": 1}
@@ -294,6 +296,7 @@ async def backtest_combo(
 
         current_high = row.high
         current_low  = row.low
+        current_time = row.open_time
 
         # ── Check exits for all open trades ─────────────────────────
         still_open = []
@@ -311,6 +314,19 @@ async def backtest_combo(
                 elif current_high >= trade["sl"]:
                     exit_px, exit_why = trade["sl"], "SL_HIT"
                 pnl = ((trade["entry"] - exit_px) * trade["lot"]) if exit_px else None
+
+            # Max hold time — force-close at current close if a trade has
+            # been open longer than MAX_HOLD_HOURS (default 7 days), even
+            # if neither SL nor TP has been hit. Prevents capital sitting
+            # tied up indefinitely in a setup whose original thesis has
+            # gone stale.
+            if exit_px is None:
+                hours_open = (current_time - trade["opened_at"]).total_seconds() / 3600
+                if hours_open >= MAX_HOLD_HOURS:
+                    exit_px = row.close
+                    exit_why = "MAX_HOLD_TIME"
+                    pnl = ((exit_px - trade["entry"]) * trade["lot"]) if trade["side"] == "LONG" \
+                          else ((trade["entry"] - exit_px) * trade["lot"])
 
             if exit_px is not None:
                 pnl     -= exit_px * trade["lot"] * COMMISSION_PCT
@@ -397,6 +413,7 @@ async def backtest_combo(
                             "side": sig["side"], "entry": sig["entry"],
                             "sl": sig["sl"], "tp": sig["tp"], "lot": lot,
                             "ind_s": ind_s, "ind_t": ind_t,
+                            "opened_at": row.open_time,
                         })
 
     logger.info(f"Simulation loop for {symbol}: {time.time() - t_sim:.1f}s ({len(merged):,} candles)")

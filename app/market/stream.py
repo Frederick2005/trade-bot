@@ -1,3 +1,14 @@
+"""
+app/market/stream.py
+Binance WebSocket candle stream.
+
+WHY WE COLLECT EXTRA KLINE FIELDS:
+  buy_volume  → tells us who is driving the move. When buy volume
+                dominates a candle, the move has real buyers behind it
+                not just short covering. AI learns this distinction.
+  num_trades  → high trade count = high participation = stronger signal
+  quote_volume → USDT volume, more stable measure than coin volume
+"""
 import asyncio
 from datetime import datetime, timezone
 from typing import Callable, Awaitable
@@ -23,36 +34,30 @@ def _parse_kline(msg: dict) -> dict | None:
         if not k.get("x", False):
             return None
         return {
-            "open_time": datetime.fromtimestamp(
-                k["t"] / 1000, tz=timezone.utc
-            ).isoformat(),
-            "open":   k["o"],
-            "high":   k["h"],
-            "low":    k["l"],
-            "close":  k["c"],
-            "volume": k["v"],
+            "open_time":   datetime.fromtimestamp(k["t"] / 1000, tz=timezone.utc).isoformat(),
+            "open":        k["o"],
+            "high":        k["h"],
+            "low":         k["l"],
+            "close":       k["c"],
+            "volume":      k["v"],
+            # Extended fields — all available in the kline WebSocket
+            "quote_volume": k.get("q", 0),   # Quote asset volume (USDT)
+            "num_trades":   k.get("n", 0),   # Number of trades in candle
+            "buy_volume":   k.get("V", 0),   # Taker buy base asset volume
         }
     except (KeyError, TypeError, ValueError):
         return None
 
 
 async def _create_client() -> AsyncClient:
-    """Create Binance client with explicit testnet URLs to avoid geo-blocking."""
-    if BINANCE.testnet:
-        client = await AsyncClient.create(
-            api_key=BINANCE.api_key,
-            api_secret=BINANCE.api_secret,
-            testnet=True,
-            tld="com",
-        )
-        # Override to testnet endpoints explicitly
-        client.API_URL = "https://testnet.binancefuture.com/fapi/v1"
-        client.STREAM_URL = "wss://stream.binancefuture.com/ws"
-    else:
-        client = await AsyncClient.create(
-            api_key=BINANCE.api_key,
-            api_secret=BINANCE.api_secret,
-        )
+    client = AsyncClient(
+        api_key=BINANCE.api_key,
+        api_secret=BINANCE.api_secret,
+        testnet=BINANCE.testnet,
+    )
+    await client.close_connection()
+    client.session = client._init_session()
+    logger.info(f"Binance client ready ({'TESTNET' if BINANCE.testnet else 'LIVE'})")
     return client
 
 
@@ -90,10 +95,7 @@ async def _stream_with_reconnect(
             await _stream_symbol(client, symbol, timeframe, on_close)
         except Exception as e:
             state.binance_connected = False
-            logger.warning(
-                f"Stream {symbol} {timeframe} disconnected: {e} — "
-                f"reconnecting in {delay}s"
-            )
+            logger.warning(f"Stream {symbol} {timeframe} disconnected: {e} — reconnecting in {delay}s")
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
         else:
@@ -104,22 +106,12 @@ async def start_streams(on_candle_close: OnCandleClose) -> None:
     logger.info("Starting Binance WebSocket streams...")
     client = await _create_client()
 
-    # 3-tier per AtlasQuant v2: primary (4H) is now also streamed, not just
-    # secondary/execution — the decision engine needs primary-timeframe
-    # indicators for Stage 1 (regime) and Stage 2 (HTF trend alignment).
-    timeframes = [TIMEFRAMES.execution, TIMEFRAMES.secondary, TIMEFRAMES.primary]
-
     tasks = []
     for symbol in TRADING.symbols:
-        for tf in timeframes:
-            tasks.append(
-                asyncio.create_task(
-                    _stream_with_reconnect(client, symbol, tf, on_candle_close)
-                )
-            )
+        for tf in [TIMEFRAMES.signal, TIMEFRAMES.trend]:
+            tasks.append(asyncio.create_task(
+                _stream_with_reconnect(client, symbol, tf, on_candle_close)
+            ))
 
-    logger.info(
-        f"Streaming {len(tasks)} feeds: "
-        f"{TRADING.symbols} × {timeframes}"
-    )
+    logger.info(f"Streaming {len(tasks)} feeds: {TRADING.symbols} × [{TIMEFRAMES.signal}, {TIMEFRAMES.trend}]")
     await asyncio.gather(*tasks)

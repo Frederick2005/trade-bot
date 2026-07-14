@@ -1,29 +1,60 @@
 """
-TradingEngine — updated to support:
-  - Up to 10 concurrent trades across all symbols
-  - 15m signal + 1h trend timeframes
-  - Trailing stop + breakeven logic
-  - Position tracking by trade_id (not just symbol)
+app/engine.py
+Main event loop — wires every module together.
+
+KEY IMPROVEMENTS IN THIS VERSION:
+───────────────────────────────────
+1. MFE/MAE tracking on every candle
+   Every open trade tracks how far price moves in its
+   favour and against it. This data teaches the AI
+   exactly where stops and targets should be placed.
+
+2. AI prediction logging
+   Every time the AI makes a prediction it's logged
+   with the feature vector and confidence. When the
+   trade closes the outcome is marked correct/incorrect.
+   Over time this shows model accuracy per market regime.
+
+3. Fees calculated on entry and exit
+   Binance charges 0.05% per side. Fees are now tracked
+   per trade so the AI learns true net profitability,
+   not gross profitability.
+
+4. Equity snapshots
+   Balance before and after each trade is recorded.
+   AI learns how drawdown periods affect signal quality
+   and becomes more conservative during losing streaks.
+
+5. Extended context saved on entry
+   All 38 new indicator fields are captured at entry
+   and saved to trade_context for AI training.
 """
 import asyncio
+import os
+import time
+import tempfile
 from datetime import datetime, timezone
 from loguru import logger
 
-from app.config import TRADING, TIMEFRAMES, AI, DECISION_ENGINE, log_config
+from app.config import TRADING, TIMEFRAMES, AI, log_config
 from app.state import state
 from app.market import candles as candle_store
 from app.market.stream import start_streams
 from app.strategy.ema_rsi import EmaRsiStrategy
-from app.strategy.base import Signal
-from app.strategy import decision_engine
 from app.strategy.params import get_active_params
-from app.risk.guards import check_all, has_correlated_exposure
+from app.risk.guards import check_all
 from app.risk.limits import check_emergency_stop, auto_reduce_leverage
 from app.risk.sizing import calculate_lot_size
 from app.database.client import check_connection
-from app.database.trades import save_trade, close_trade, get_open_trades, count_closed_trades
+from app.database.trades import (
+    save_trade, close_trade, get_open_trades,
+    count_closed_trades, update_mfe_mae,
+)
 from app.database.market import get_candles
-from app.database.context import save_trade_context, log_decision, log_bot_event, save_signal_decision
+from app.database.context import (
+    save_trade_context, log_decision, log_bot_event,
+    save_ai_prediction_log, update_prediction_outcome,
+)
 from app.learning.engine import on_trade_closed
 from app.notifications import telegram
 from app.notifications.messages import (
@@ -35,68 +66,26 @@ from app.notifications.messages import (
 )
 from app.ai.features import build_feature_vector
 import app.ai.model as ai_model
-from app.strategy.signal_logic import ATR_MULTIPLIER as STOP_ATR_MULTIPLIER
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-# MAX_OPEN_TRADES was previously hardcoded to 10 here, completely ignoring
-# TRADING.max_open_trades from app/config.py (which reads your .env
-# MAX_OPEN_TRADES setting, default 2). That meant changing MAX_OPEN_TRADES in
-# .env had zero effect on the live bot. Now sourced from config directly, see
-# usages below (kept as a property so it always reflects current config).
-#
-# BREAKEVEN_ATR_MULT was 1.0, meaning breakeven triggered before the stop-loss
-# distance was even covered (stop = 1.5×ATR per signal_logic.ATR_MULTIPLIER).
-# LTA Concepts Ch. 35 is explicit: move to breakeven "once a trade reaches
-# 1R" — i.e. once profit covers the ORIGINAL STOP DISTANCE, not some smaller
-# fixed ATR multiple. Set to match the actual stop distance so breakeven
-# really is "at 1R".
-BREAKEVEN_ATR_MULT = STOP_ATR_MULTIPLIER   # = 1R, matches the actual stop distance
-TRAILING_ATR_MULT  = 1.5    # trail SL at 1.5×ATR behind price after breakeven
+# Track MFE/MAE per open trade: trade_id -> (mfe, mae, entry_price, side, opened_at)
+_excursion_tracker: dict[str, dict] = {}
 
-
-class ActiveTrade:
-    """Tracks a single open position with trailing stop state."""
-    def __init__(
-        self,
-        trade_id: str,
-        symbol: str,
-        side: str,
-        entry_price: float,
-        stop_loss: float,
-        take_profit: float,
-        lot_size: float,
-        atr: float,
-        opened_at: str,
-        strategy_version: str,
-        order_id: str | None = None,
-    ):
-        self.trade_id         = trade_id
-        self.symbol           = symbol
-        self.side             = side
-        self.entry_price      = entry_price
-        self.stop_loss        = stop_loss
-        self.take_profit      = take_profit
-        self.lot_size         = lot_size
-        self.atr              = atr
-        self.opened_at        = opened_at
-        self.strategy_version = strategy_version
-        self.order_id         = order_id
-        self.breakeven_hit    = False   # has SL been moved to breakeven yet?
-        self.highest_price    = entry_price  # for trailing stop tracking
+# Binance futures fee per side
+BINANCE_FEE_PCT = 0.0005
 
 
 class TradingEngine:
     def __init__(self):
-        self.strategy      = EmaRsiStrategy(version="v1.0")
-        self.active_trades: dict[str, ActiveTrade] = {}  # trade_id -> ActiveTrade
-        self._last_signal:  dict[str, str]         = {}  # symbol -> last side
+        self.strategy  = EmaRsiStrategy(version="v1.0")
+        self.scheduler = AsyncIOScheduler(timezone="UTC")
 
-    # ── Startup ───────────────────────────────────────────────────────────────
+    # ── Startup ───────────────────────────────────────────────────
 
     async def start(self) -> None:
         log_config()
         logger.info(f"Starting engine in {TRADING.mode.upper()} mode")
-        logger.info(f"Max concurrent trades: {TRADING.max_open_trades}")
 
         state.supabase_connected = check_connection()
         if not state.supabase_connected:
@@ -107,10 +96,11 @@ class TradingEngine:
         await self._load_ai_model()
         await self._reconcile_open_trades()
 
+        # Restore balance from last session
         from app.database.client import get_state_value, set_state_value
-        restored               = await self._get_balance()
-        state.balance          = restored
-        state.equity           = restored
+        restored = await self._get_balance()
+        state.balance = restored
+        state.equity  = restored
 
         saved_start = get_state_value("starting_balance")
         if saved_start:
@@ -123,7 +113,7 @@ class TradingEngine:
         state.daily_reset_date = datetime.now(timezone.utc).date()
 
         logger.info(
-            f"Balance: ${state.balance:,.2f} | "
+            f"Balance restored: ${state.balance:,.2f} | "
             f"Start: ${state.starting_balance:,.2f} | "
             f"Drawdown: {state.drawdown_pct():.2%}"
         )
@@ -132,37 +122,45 @@ class TradingEngine:
         asyncio.create_task(self._daily_reset_loop())
         asyncio.create_task(telegram.start_listener())
 
-        import os, time, tempfile
+        # Start scheduled jobs
+        self._setup_scheduler()
+        self.scheduler.start()
+
+        # Live mode exit monitor — checks open positions every minute
+        if TRADING.mode == "live":
+            asyncio.create_task(self._live_exit_monitor())
+
+        # Startup message with cooldown to prevent spam on crash restarts
         last_start_file = os.path.join(tempfile.gettempdir(), "bot_last_start")
-        now = time.time()
-        send_startup_msg = True
+        now_ts          = time.time()
+        send_startup    = True
+
         if os.path.exists(last_start_file):
             try:
-                with open(last_start_file) as f:
-                    last = float(f.read())
-                if now - last < 600:
-                    send_startup_msg = False
+                with open(last_start_file) as _f:
+                    last = float(_f.read())
+                if now_ts - last < 600:
+                    send_startup = False
             except Exception:
                 pass
         try:
-            with open(last_start_file, "w") as f:
-                f.write(str(now))
+            with open(last_start_file, "w") as _f:
+                _f.write(str(now_ts))
         except Exception:
             pass
 
-        if send_startup_msg:
+        if send_startup:
             await telegram.send(
                 f"🚀 *Bot started*\n"
                 f"Mode: `{TRADING.mode.upper()}`\n"
                 f"Balance: `${state.balance:,.2f}`\n"
                 f"Symbols: `{', '.join(TRADING.symbols)}`\n"
-                f"Max trades: `{TRADING.max_open_trades}`\n"
-                f"Timeframes: `{TIMEFRAMES.signal}/{TIMEFRAMES.trend}`"
+                f"AI model: `{state.active_model_version or 'none'}`"
             )
 
         await start_streams(on_candle_close=self._on_candle_close)
 
-    # ── Candle close handler ──────────────────────────────────────────────────
+    # ── Candle close handler ──────────────────────────────────────
 
     async def _on_candle_close(
         self, symbol: str, timeframe: str, candle: dict
@@ -170,6 +168,7 @@ class TradingEngine:
         if timeframe != TIMEFRAMES.signal:
             return
 
+        # Emergency stop check
         stop, reason = check_emergency_stop()
         if stop:
             logger.critical(reason)
@@ -178,6 +177,7 @@ class TradingEngine:
             state.is_paused = True
             return
 
+        # Daily loss limit
         if state.daily_loss_pct() >= TRADING.daily_loss_limit:
             if not state.is_paused:
                 state.is_paused = True
@@ -186,233 +186,97 @@ class TradingEngine:
                 )
             return
 
-        # Update trailing stops for all open trades on this symbol
+        # Update MFE/MAE and check exits
         current_price = float(candle["close"])
-        await self._update_trailing_stops(symbol, current_price)
-
-        # Check paper exits
         if TRADING.mode == "paper":
+            await self._update_excursions(symbol, current_price)
             await self._check_paper_exits(symbol, candle)
+        else:
+            await self._update_excursions(symbol, current_price)
 
-        # Evaluate new signal
+        # Evaluate strategy for new signals
         await self._evaluate_signal(symbol)
 
-    # ── Trailing stop + breakeven logic ───────────────────────────────────────
-
-    async def _update_trailing_stops(
-        self, symbol: str, current_price: float
-    ) -> None:
-        """
-        For each open trade on this symbol:
-        1. Once profit >= 1R (stop distance) → move SL to breakeven (entry price)
-        2. After breakeven → trail SL at 1.5×ATR behind the most favorable
-           price seen
-
-        Handles LONG and SHORT symmetrically. Previously this method had
-        `if trade.side != "LONG": continue` at the top — SHORT trades got
-        no breakeven or trailing-stop protection at all. That combined with
-        the engine.py argument-swap bug elsewhere meant SHORT signals may
-        rarely have fired before, so this gap likely went unnoticed; now
-        that SHORT signals fire correctly, this matters.
-        """
-        for trade_id, trade in list(self.active_trades.items()):
-            if trade.symbol != symbol:
-                continue
-
-            is_long = trade.side == "LONG"
-            profit_dist = (
-                (current_price - trade.entry_price) if is_long
-                else (trade.entry_price - current_price)
-            )
-
-            # Step 1 — breakeven at 1R
-            if not trade.breakeven_hit:
-                if profit_dist >= trade.atr * BREAKEVEN_ATR_MULT:
-                    new_sl = trade.entry_price
-                    improves = (new_sl > trade.stop_loss) if is_long else (new_sl < trade.stop_loss)
-                    if improves:
-                        trade.stop_loss    = new_sl
-                        trade.breakeven_hit = True
-                        logger.info(
-                            f"Breakeven triggered: {symbol} trade={trade_id[:8]} "
-                            f"SL moved to {new_sl:.2f}"
-                        )
-
-            # Step 2 — trailing stop
-            if trade.breakeven_hit:
-                if is_long:
-                    if current_price > trade.highest_price:
-                        trade.highest_price = current_price
-                    trailing_sl = trade.highest_price - (trade.atr * TRAILING_ATR_MULT)
-                    if trailing_sl > trade.stop_loss:
-                        trade.stop_loss = trailing_sl
-                        logger.debug(
-                            f"Trailing stop updated: {symbol} "
-                            f"trade={trade_id[:8]} SL={trailing_sl:.2f}"
-                        )
-                else:
-                    if current_price < trade.highest_price:
-                        trade.highest_price = current_price
-                    trailing_sl = trade.highest_price + (trade.atr * TRAILING_ATR_MULT)
-                    if trailing_sl < trade.stop_loss:
-                        trade.stop_loss = trailing_sl
-                        logger.debug(
-                            f"Trailing stop updated: {symbol} "
-                            f"trade={trade_id[:8]} SL={trailing_sl:.2f}"
-                        )
-
-    # ── Signal evaluation ─────────────────────────────────────────────────────
+    # ── Signal evaluation ─────────────────────────────────────────
 
     async def _evaluate_signal(self, symbol: str) -> None:
-        # Check global trade cap, pause state, and the losing-streak breaker
-        # (configurable via MAX_LOSING_STREAK, generalized from the old
-        # fixed Two-Strike Rule). state.can_trade() existed before this fix
-        # but was never actually called anywhere in the engine — max_open
-        # was checked separately below, and is_paused / streak blocking had no
-        # effect on whether new trades opened at all.
-        can_trade, block_reason = state.can_trade(TRADING.max_open_trades)
-        if not can_trade:
-            logger.debug(f"Skipping {symbol}: {block_reason}")
+        ind_1h = candle_store.get_indicators(symbol, TIMEFRAMES.signal)
+        ind_4h = candle_store.get_indicators(symbol, TIMEFRAMES.trend)
+
+        if ind_1h is None or ind_4h is None:
             return
 
-        # Prevent multiple concurrent trades on the SAME symbol. This guard
-        # was missing entirely — self.active_trades is keyed by trade_id and
-        # would happily track two simultaneous positions on one symbol, but
-        # app/state.py's state.open_trades is keyed by SYMBOL (see
-        # app/execution/binance.py / paper.py: `state.open_trades[symbol] =
-        # trade`). A second trade on the same symbol would silently
-        # overwrite the first one's entry in state.open_trades, corrupting
-        # the per-symbol checks in app/risk/guards.py and Telegram
-        # notifications for whichever trade got overwritten. One trade per
-        # symbol at a time is also just the saner default for a bot that
-        # now fires both LONG and SHORT signals.
-        if any(t.symbol == symbol for t in self.active_trades.values()):
-            logger.debug(f"Skipping {symbol}: trade already open on this symbol")
-            return
+        signal = self.strategy.evaluate(symbol, ind_1h, ind_4h)
 
-        ind_execution = candle_store.get_indicators(symbol, TIMEFRAMES.execution)
-        ind_secondary = candle_store.get_indicators(symbol, TIMEFRAMES.secondary)
-        ind_primary   = candle_store.get_indicators(symbol, TIMEFRAMES.primary)
-
-        if ind_execution is None or ind_secondary is None or ind_primary is None:
-            return
-
-        df_execution = candle_store.get_df(symbol, TIMEFRAMES.execution)
-        df_secondary = candle_store.get_df(symbol, TIMEFRAMES.secondary)
-        df_primary   = candle_store.get_df(symbol, TIMEFRAMES.primary)
-
-        # Full multi-stage pipeline (regime -> trend -> structure -> quality
-        # score -> dynamic stop/target), replacing the old direct call to
-        # self.strategy.evaluate(). signal_logic.evaluate_entry() (used
-        # inside EmaRsiStrategy) is still the base technical trigger this
-        # wraps — decision_engine doesn't duplicate that logic, it adds the
-        # regime gate, 3-timeframe alignment, market structure, and the
-        # 0-100 quality score gate on top of it.
-        decision = decision_engine.evaluate_setup(
-            df_execution=df_execution,
-            df_secondary=df_secondary,
-            df_primary=df_primary,
-            ind_execution=ind_execution,
-            ind_secondary=ind_secondary,
-            ind_primary=ind_primary,
-            quality_threshold=DECISION_ENGINE.quality_threshold,
-            min_reward_ratio=DECISION_ENGINE.min_reward_ratio,
-        )
-
-        await save_signal_decision(symbol=symbol, decision=decision)
-
-        if not decision.accepted:
+        if signal is None:
             await log_decision(
-                symbol=symbol,
-                action="SKIPPED",
-                reason=decision.rejection_reason or "Setup rejected",
-                signal_type=decision.side,
-                rsi=ind_execution.get("rsi"),
-                atr=ind_execution.get("atr"),
-                confidence=(decision.quality_score or 0),
+                symbol=symbol, action="SKIPPED",
+                reason="No signal from strategy",
+                rsi=ind_1h.get("rsi"), atr=ind_1h.get("atr"),
             )
             return
 
-        signal = Signal(
-            symbol=symbol,
-            side=decision.side,
-            entry_price=decision.entry,
-            stop_loss=decision.stop_loss,
-            take_profit=decision.take_profit,
-            confidence=(decision.quality_score or 0) / 100.0,
-            reason=decision.reason or "",
-            indicators={
-                **ind_execution,
-                "regime": decision.regime,
-                "structure": decision.structure,
-                "quality_score": decision.quality_score,
-                "quality_subscores": decision.quality_subscores,
-            },
-        )
+        # ── AI confidence filter ──────────────────────────────────
+        confidence      = signal.confidence
+        ai_features     = None
+        ai_importance   = {}
+        ai_inference_ms = 0.0
 
-        # ── AI confidence filter ───────────────────────────────────
-        confidence  = signal.confidence
         if ai_model.is_loaded():
-            features = build_feature_vector(
-                ind_execution, ind_secondary,
+            t_start      = time.time()
+            ai_features  = build_feature_vector(
+                ind_1h, ind_4h,
                 candle_time=datetime.now(timezone.utc),
                 recent_win_rate=0.5,
                 current_drawdown=state.drawdown_pct(),
             )
-            ai_conf, _ = ai_model.predict(features)
-            confidence  = ai_conf
+            ai_conf, ai_sig    = ai_model.predict(ai_features)
+            ai_importance      = ai_model.get_feature_importance()
+            ai_inference_ms    = (time.time() - t_start) * 1000
+            confidence         = ai_conf
+
             if ai_conf < AI.min_confidence:
                 await log_decision(
-                    symbol=symbol,
-                    action="SKIPPED",
-                    reason=f"AI conf {ai_conf:.2%} < {AI.min_confidence:.2%}",
+                    symbol=symbol, action="SKIPPED",
+                    reason=f"AI confidence {ai_conf:.2%} below {AI.min_confidence:.2%}",
                     signal_type=signal.side,
-                    rsi=ind_execution.get("rsi"),
+                    rsi=ind_1h.get("rsi"),
                     confidence=ai_conf * 100,
                 )
                 return
 
-        # ── Risk guards ────────────────────────────────────────────
+        # ── Risk guards ───────────────────────────────────────────
         allowed, reason = check_all(symbol, signal.side)
         if not allowed:
             await log_decision(
                 symbol=symbol, action="BLOCKED", reason=reason,
-                signal_type=signal.side, rsi=ind_execution.get("rsi"),
+                signal_type=signal.side, rsi=ind_1h.get("rsi"),
                 confidence=confidence * 100,
             )
             return
 
-        # ── Position sizing ────────────────────────────────────────
-        # If a same-side trade is already open on a correlated symbol
-        # (see app/risk/guards.py) and CORRELATION_MODE=reduce_size, halve
-        # risk on this trade instead of either blocking it outright or
-        # letting total correlated exposure silently double.
-        risk_multiplier = 1.0
-        if TRADING.correlation_mode == "reduce_size" and has_correlated_exposure(symbol, signal.side):
-            risk_multiplier = 0.5
-            logger.info(
-                f"Correlated exposure detected for {symbol} {signal.side} — "
-                f"sizing at {risk_multiplier}x normal risk"
-            )
-
-        leverage = auto_reduce_leverage(state.balance, TRADING.max_leverage)
+        # ── Position sizing ───────────────────────────────────────
+        leverage           = auto_reduce_leverage(state.balance, TRADING.max_leverage)
         lot_size, notional = calculate_lot_size(
             balance=state.balance,
             entry_price=signal.entry_price,
             stop_loss=signal.stop_loss,
             leverage=leverage,
-            risk_multiplier=risk_multiplier,
         )
         if lot_size == 0:
-            await log_decision(symbol, "BLOCKED", "Position too small")
+            await log_decision(symbol, "BLOCKED", "Position size too small")
             return
 
-        # ── Execute ────────────────────────────────────────────────
+        # Calculate entry fee
+        entry_fee   = notional * BINANCE_FEE_PCT
+        risk_amount = abs(signal.entry_price - signal.stop_loss) * lot_size
+
+        # ── Execute ───────────────────────────────────────────────
         trade_result = await self._execute(signal, lot_size, notional)
         if trade_result is None:
             return
 
-        # ── Save to DB ─────────────────────────────────────────────
+        # ── Save trade to DB ──────────────────────────────────────
         trade_id = await save_trade(
             symbol=symbol,
             side=signal.side,
@@ -423,42 +287,82 @@ class TradingEngine:
             strategy_version=get_active_params().version,
             account_balance=state.balance,
             order_id=trade_result.get("order_id"),
+            leverage=leverage,
+            risk_amount=risk_amount,
+            fees_entry=entry_fee,
         )
 
         if trade_id:
-            # Track in active trades with ATR for trailing stop
-            atr = ind_execution.get("atr", 0.0)
-            self.active_trades[trade_id] = ActiveTrade(
-                trade_id=trade_id,
-                symbol=symbol,
-                side=signal.side,
-                entry_price=signal.entry_price,
-                stop_loss=signal.stop_loss,
-                take_profit=signal.take_profit,
-                lot_size=lot_size,
-                atr=atr,
-                opened_at=datetime.now(timezone.utc).isoformat(),
-                strategy_version=get_active_params().version,
-                order_id=trade_result.get("order_id"),
-            )
+            # Start excursion tracking for this trade
+            _excursion_tracker[symbol] = {
+                "trade_id":    trade_id,
+                "entry_price": signal.entry_price,
+                "side":        signal.side,
+                "opened_at":   datetime.now(timezone.utc),
+                "mfe":         0.0,
+                "mae":         0.0,
+            }
 
+            # Build extended context with all new indicators
             ctx = {
-                **signal.indicators,
-                "hour_of_day": datetime.now(timezone.utc).hour,
-                "day_of_week": datetime.now(timezone.utc).weekday(),
+                "ema50_1h":       ind_1h.get("ema50"),
+                "ema200_1h":      ind_1h.get("ema200"),
+                "rsi_1h":         ind_1h.get("rsi"),
+                "atr_1h":         ind_1h.get("atr"),
+                "ema50_4h":       ind_4h.get("ema50"),
+                "ema200_4h":      ind_4h.get("ema200"),
+                "rsi_4h":         ind_4h.get("rsi"),
+                "atr_4h":         ind_4h.get("atr"),
+                "price_vs_ema50": ind_1h.get("price_vs_ema50"),
+                "trend_strength": ind_1h.get("trend_strength"),
+                "volatility_pct": ind_1h.get("volatility_pct"),
+                "volume_ratio":   ind_1h.get("volume_ratio"),
+                "ema_gap_pct":    ind_1h.get("ema_gap_pct"),
+                "candle_body_pct":ind_1h.get("candle_body_pct"),
+                "rsi_divergence": ind_1h.get("rsi") - ind_4h.get("rsi", ind_1h.get("rsi")),
+                "hour_of_day":    datetime.now(timezone.utc).hour,
+                "day_of_week":    datetime.now(timezone.utc).weekday(),
+                "trend_4h":       1 if ind_4h["ema50"] > ind_4h["ema200"] else -1,
+                # New extended fields
+                "macd":           ind_1h.get("macd"),
+                "macd_signal":    ind_1h.get("macd_signal"),
+                "macd_histogram": ind_1h.get("macd_histogram"),
+                "stoch_rsi_k":    ind_1h.get("stoch_rsi_k"),
+                "adx":            ind_1h.get("adx"),
+                "cci":            ind_1h.get("cci"),
+                "obv":            ind_1h.get("obv"),
+                "bb_upper":       ind_1h.get("bb_upper"),
+                "bb_lower":       ind_1h.get("bb_lower"),
+                "bb_width":       ind_1h.get("bb_width"),
+                "supertrend":     ind_1h.get("supertrend"),
+                "supertrend_dir": ind_1h.get("supertrend_dir"),
+                "realized_vol":   ind_1h.get("realized_vol"),
+                "atr_percentile": ind_1h.get("atr_percentile"),
+                "market_regime":  ind_1h.get("market_regime"),
+                "volume_ratio":   ind_1h.get("volume_ratio"),
             }
             await save_trade_context(trade_id, ctx)
-            await log_decision(
-                symbol=symbol, action="ENTERED", reason=signal.reason,
-                signal_type=signal.side, rsi=ind_execution.get("rsi"),
-                atr=ind_execution.get("atr"), confidence=confidence * 100,
-            )
 
-            logger.info(
-                f"Trade opened: {symbol} {signal.side} | "
-                f"entry={signal.entry_price:.2f} SL={signal.stop_loss:.2f} "
-                f"TP={signal.take_profit:.2f} | "
-                f"Active trades: {len(self.active_trades)}/{TRADING.max_open_trades}"
+            # Save AI prediction log
+            if ai_model.is_loaded() and ai_features:
+                await save_ai_prediction_log(
+                    trade_id=trade_id,
+                    model_version=ai_model.get_version() or "unknown",
+                    confidence=confidence,
+                    probability_win=confidence,
+                    chosen_action=signal.side,
+                    feature_vector=ai_features,
+                    feature_importance=ai_importance,
+                    inference_time_ms=ai_inference_ms,
+                )
+
+            await log_decision(
+                symbol=symbol, action="ENTERED",
+                reason=signal.reason,
+                signal_type=signal.side,
+                rsi=ind_1h.get("rsi"),
+                atr=ind_1h.get("atr"),
+                confidence=confidence * 100,
             )
 
         await telegram.send(
@@ -469,7 +373,91 @@ class TradingEngine:
             )
         )
 
-    # ── Execution ─────────────────────────────────────────────────────────────
+    # ── Excursion tracking ────────────────────────────────────────
+
+    async def _update_excursions(self, symbol: str, current_price: float) -> None:
+        """Update MFE/MAE for all open trades on every candle close."""
+        tracker = _excursion_tracker.get(symbol)
+        if not tracker:
+            return
+        new_mfe, new_mae = await update_mfe_mae(
+            trade_id=tracker["trade_id"],
+            current_price=current_price,
+            entry_price=tracker["entry_price"],
+            side=tracker["side"],
+            current_mfe=tracker["mfe"],
+            current_mae=tracker["mae"],
+        )
+        tracker["mfe"] = new_mfe
+        tracker["mae"] = new_mae
+
+    # ── Paper exit checker ────────────────────────────────────────
+
+    async def _check_paper_exits(self, symbol: str, candle: dict) -> None:
+        from app.execution.paper import check_exits
+        trades_snapshot = {s: t for s, t in state.open_trades.items()}
+        closed          = await check_exits({symbol: float(candle["close"])})
+
+        for result in closed:
+            sym      = result["symbol"]
+            snapshot = trades_snapshot.get(sym)
+            side     = snapshot.side if snapshot else result.get("side", "?")
+            tracker  = _excursion_tracker.pop(sym, {})
+            mfe      = tracker.get("mfe", 0.0)
+            mae      = tracker.get("mae", 0.0)
+
+            # Calculate holding time
+            opened_at      = tracker.get("opened_at", datetime.now(timezone.utc))
+            holding_mins   = int((datetime.now(timezone.utc) - opened_at).total_seconds() / 60)
+
+            # Exit fee
+            exit_notional  = result["exit_price"] * (snapshot.lot_size if snapshot else 0)
+            exit_fee       = exit_notional * BINANCE_FEE_PCT
+
+            # Fetch DB trade record
+            from app.database.trades import get_closed_trades
+            recent = await get_closed_trades(limit=1)
+
+            if recent:
+                t       = recent[0]
+                trade_id = t["id"]
+
+                # Update trade with full lifecycle data
+                await close_trade(
+                    trade_id=trade_id,
+                    exit_price=result["exit_price"],
+                    profit_loss=result["pnl"],
+                    profit_pct=result["pnl_pct"],
+                    exit_reason=result["reason"],
+                    fees_exit=exit_fee,
+                    mfe=mfe,
+                    mae=mae,
+                    holding_minutes=holding_mins,
+                    equity_after=state.balance,
+                )
+
+                # Save balance to Supabase
+                from app.database.client import set_state_value
+                set_state_value("paper_balance", str(round(state.balance, 8)))
+
+                # Run learning loop with full context
+                ind_1h = candle_store.get_indicators(sym, TIMEFRAMES.signal) or {}
+                ind_4h = candle_store.get_indicators(sym, TIMEFRAMES.trend) or {}
+                await on_trade_closed(t, ind_1h, ind_4h)
+
+            await telegram.send(
+                msg_closed(
+                    symbol=sym,
+                    side=side,
+                    exit_price=result["exit_price"],
+                    pnl=result["pnl"],
+                    pnl_pct=result["pnl_pct"],
+                    reason=result["reason"],
+                    balance=state.balance,
+                )
+            )
+
+    # ── Execution dispatch ────────────────────────────────────────
 
     async def _execute(self, signal, lot_size: float, notional: float) -> dict | None:
         if TRADING.mode == "paper":
@@ -487,63 +475,7 @@ class TradingEngine:
             strategy_version=get_active_params().version,
         )
 
-    # ── Paper exit checker ────────────────────────────────────────────────────
-
-    async def _check_paper_exits(self, symbol: str, candle: dict) -> None:
-        from app.execution.paper import check_exits
-
-        # Build price map for all symbols
-        price_map = {symbol: float(candle["close"])}
-
-        # Check exits using updated SL/TP from trailing stop logic
-        # Pass current active trades so paper executor uses updated SL values
-        closed = await check_exits(price_map)
-
-        for result in closed:
-            sym      = result["symbol"]
-            trade_id = result.get("trade_id")
-
-            # Get side from active trades
-            trade = None
-            if trade_id and trade_id in self.active_trades:
-                trade = self.active_trades.pop(trade_id)
-            else:
-                # Fallback: find by symbol
-                for tid, t in list(self.active_trades.items()):
-                    if t.symbol == sym:
-                        trade = self.active_trades.pop(tid)
-                        break
-
-            side = trade.side if trade else result.get("side", "LONG")
-
-            from app.database.trades import get_closed_trades
-            recent = await get_closed_trades(limit=1)
-            if recent:
-                t      = recent[0]
-                ind_s  = candle_store.get_indicators(sym, TIMEFRAMES.signal) or {}
-                ind_t  = candle_store.get_indicators(sym, TIMEFRAMES.trend)  or {}
-                await on_trade_closed(t, ind_s, ind_t)
-
-            logger.info(
-                f"Trade closed: {sym} {side} | "
-                f"exit={result['exit_price']:.2f} "
-                f"pnl={result['pnl']:+.2f} ({result['reason']}) | "
-                f"Active trades: {len(self.active_trades)}/{TRADING.max_open_trades}"
-            )
-
-            await telegram.send(
-                msg_closed(
-                    symbol=sym,
-                    side=side,
-                    exit_price=result["exit_price"],
-                    pnl=result["pnl"],
-                    pnl_pct=result["pnl_pct"],
-                    reason=result["reason"],
-                    balance=state.balance,
-                )
-            )
-
-    # ── Background loops ──────────────────────────────────────────────────────
+    # ── Background loops ──────────────────────────────────────────
 
     async def _heartbeat_loop(self) -> None:
         import app.config as cfg
@@ -553,7 +485,7 @@ class TradingEngine:
             await telegram.send(
                 msg_heartbeat(
                     balance=state.balance,
-                    open_trades=len(self.active_trades),
+                    open_trades=state.open_trade_count(),
                     binance_ok=state.binance_connected,
                     supabase_ok=state.supabase_connected,
                     mode=TRADING.mode,
@@ -573,11 +505,10 @@ class TradingEngine:
                     logger.info("Daily limit reset — bot unpaused")
                     await telegram.send("🔄 New trading day — bot unpaused")
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────
 
     async def _get_balance(self) -> float:
         if TRADING.mode == "paper":
-            import os
             from app.database.client import get_state_value, set_state_value
             saved = get_state_value("paper_balance")
             if saved:
@@ -586,18 +517,14 @@ class TradingEngine:
                 return balance
             default = float(os.getenv("PAPER_BALANCE", "500"))
             set_state_value("paper_balance", str(default))
-            logger.info(f"Paper balance initialised: ${default:,.2f}")
             return default
         from app.execution.binance import get_account_balance
         return await get_account_balance()
 
     async def _seed_candles(self) -> None:
         for symbol in TRADING.symbols:
-            for tf in [TIMEFRAMES.execution, TIMEFRAMES.secondary, TIMEFRAMES.primary]:
-                # Primary (4H) needs more history for market_structure's
-                # swing detection to have enough confirmed swings.
-                limit = 500 if tf != TIMEFRAMES.primary else 300
-                df = await get_candles(symbol, tf, limit=limit)
+            for tf in [TIMEFRAMES.signal, TIMEFRAMES.trend]:
+                df = await get_candles(symbol, tf, limit=300)
                 if not df.empty:
                     candle_store.seed(symbol, tf, df)
                 else:
@@ -616,30 +543,196 @@ class TradingEngine:
             state.model_loaded         = loaded
             state.active_model_version = version_row["version"] if loaded else None
         else:
-            logger.info("No AI model found — running rule-based only")
+            logger.info("No trained AI model found — running rule-based only")
 
     async def _reconcile_open_trades(self) -> None:
         db_open = await get_open_trades()
         if db_open:
-            logger.warning(
-                f"Found {len(db_open)} open trades in DB on startup"
-            )
+            logger.warning(f"Found {len(db_open)} open trades in DB on startup")
+            from app.state import OpenTrade
             for t in db_open:
-                trade_id = t["id"]
-                atr      = float(t.get("atr", 0.0) or 0.0)
-                self.active_trades[trade_id] = ActiveTrade(
-                    trade_id=trade_id,
+                state.open_trades[t["symbol"]] = OpenTrade(
+                    trade_id=t["id"],
                     symbol=t["symbol"],
                     side=t["side"],
                     entry_price=float(t["entry_price"]),
                     stop_loss=float(t["stop_loss"]),
                     take_profit=float(t["take_profit"]),
                     lot_size=float(t["lot_size"]),
-                    atr=atr,
                     opened_at=t["opened_at"],
                     strategy_version=t["strategy_version"],
                     order_id=t.get("order_id"),
                 )
+                # Restart excursion tracking
+                _excursion_tracker[t["symbol"]] = {
+                    "trade_id":    t["id"],
+                    "entry_price": float(t["entry_price"]),
+                    "side":        t["side"],
+                    "opened_at":   datetime.now(timezone.utc),
+                    "mfe":         0.0,
+                    "mae":         0.0,
+                }
+
+    # ── Scheduler ─────────────────────────────────────────────────
+
+    def _setup_scheduler(self) -> None:
+        """
+        Sets up all scheduled background jobs.
+        Weekly report: every Sunday at 08:00 UTC
+        Daily risk snapshot: every day at 00:05 UTC
+        Model retrain check: every Sunday at 09:00 UTC
+        """
+        import app.config as cfg
+
+        # Weekly performance report + retrain
+        day = cfg.NOTIFICATIONS.weekly_report_day.lower()[:3]
+        hour = cfg.NOTIFICATIONS.weekly_report_hour
+
+        self.scheduler.add_job(
+            self._weekly_report_job,
+            CronTrigger(day_of_week=day, hour=hour, minute=0),
+            id="weekly_report",
+            replace_existing=True,
+        )
+
+        # Daily risk metrics snapshot at midnight
+        self.scheduler.add_job(
+            self._daily_risk_snapshot,
+            CronTrigger(hour=0, minute=5),
+            id="daily_risk",
+            replace_existing=True,
+        )
+
+        logger.info(
+            f"Scheduler started: weekly report every {day} at {hour:02d}:00 UTC"
+        )
+
+    async def _weekly_report_job(self) -> None:
+        """Runs every Sunday — generates report, tunes params, retrains model."""
+        try:
+            from scripts.weekly_report import generate_and_send
+            await generate_and_send()
+        except Exception as e:
+            logger.error(f"Weekly report job failed: {e}")
+
+    async def _daily_risk_snapshot(self) -> None:
+        """Saves a daily risk metrics snapshot to Supabase."""
+        try:
+            from app.database.client import get_client
+            client = get_client()
+            client.table("risk_metrics").insert({
+                "snapshot_time":    datetime.now(timezone.utc).isoformat(),
+                "period":           "DAILY",
+                "balance":          state.balance,
+                "equity":           state.equity,
+                "current_drawdown": state.drawdown_pct(),
+                "peak_balance":     state.starting_balance,
+                "daily_risk_used":  state.daily_loss_pct(),
+                "total_trades":     state.daily_trade_count,
+                "created_at":       datetime.now(timezone.utc).isoformat(),
+            }).execute()
+            logger.info(f"Daily risk snapshot saved: balance=${state.balance:,.2f}")
+        except Exception as e:
+            logger.error(f"Daily risk snapshot failed: {e}")
+
+    # ── Live trade exit monitoring ─────────────────────────────────
+
+    async def _live_exit_monitor(self) -> None:
+        """
+        Polls Binance every 60 seconds for closed live positions.
+        Only runs in live mode. Paper mode uses candle-close checks.
+        WHY: In live mode the exchange can close a position (SL/TP hit)
+        between candle closes. We need to detect this promptly so
+        the bot knows the position is gone and can take new trades.
+        """
+        logger.info("Live exit monitor started — polling every 60s")
+        while state.is_running:
+            await asyncio.sleep(60)
+            try:
+                await self._check_live_exits()
+            except Exception as e:
+                logger.error(f"Live exit monitor error: {e}")
+
+    async def _check_live_exits(self) -> None:
+        """Check if any live positions have been closed by the exchange."""
+        if not state.open_trades:
+            return
+        try:
+            from app.execution.binance import get_client as get_binance_client
+            client = await get_binance_client()
+
+            for symbol, trade in list(state.open_trades.items()):
+                positions = await client.futures_position_information(symbol=symbol)
+                for pos in positions:
+                    if float(pos.get("positionAmt", 0)) == 0:
+                        # Position closed by exchange — SL or TP hit
+                        logger.info(f"Live position closed detected: {symbol}")
+
+                        # Get recent trades to find exit price
+                        trades = await client.futures_account_trades(
+                            symbol=symbol, limit=5
+                        )
+                        exit_price = trade.entry_price
+                        if trades:
+                            exit_price = float(trades[-1]["price"])
+
+                        # Determine PnL
+                        if trade.side == "LONG":
+                            pnl     = (exit_price - trade.entry_price) * trade.lot_size
+                            reason  = "TP_HIT" if exit_price >= trade.take_profit else "SL_HIT"
+                        else:
+                            pnl     = (trade.entry_price - exit_price) * trade.lot_size
+                            reason  = "TP_HIT" if exit_price <= trade.take_profit else "SL_HIT"
+
+                        pnl_pct     = pnl / state.balance if state.balance else 0
+                        exit_fee    = exit_price * trade.lot_size * BINANCE_FEE_PCT
+                        tracker     = _excursion_tracker.pop(symbol, {})
+                        opened_at   = tracker.get("opened_at", datetime.now(timezone.utc))
+                        hold_mins   = int((datetime.now(timezone.utc) - opened_at).total_seconds() / 60)
+
+                        # Update state
+                        state.record_closed_trade(pnl)
+                        del state.open_trades[symbol]
+
+                        # Save to DB
+                        await close_trade(
+                            trade_id=trade.trade_id,
+                            exit_price=exit_price,
+                            profit_loss=pnl,
+                            profit_pct=pnl_pct,
+                            exit_reason=reason,
+                            fees_exit=exit_fee,
+                            mfe=tracker.get("mfe", 0.0),
+                            mae=tracker.get("mae", 0.0),
+                            holding_minutes=hold_mins,
+                            equity_after=state.balance,
+                        )
+
+                        # Save balance
+                        from app.database.client import set_state_value
+                        set_state_value("paper_balance", str(round(state.balance, 8)))
+
+                        # Run learning loop
+                        from app.database.trades import get_closed_trades
+                        recent = await get_closed_trades(limit=1)
+                        if recent:
+                            ind_1h = candle_store.get_indicators(symbol, TIMEFRAMES.signal) or {}
+                            ind_4h = candle_store.get_indicators(symbol, TIMEFRAMES.trend) or {}
+                            await on_trade_closed(recent[0], ind_1h, ind_4h)
+
+                        await telegram.send(
+                            msg_closed(
+                                symbol=symbol,
+                                side=trade.side,
+                                exit_price=exit_price,
+                                pnl=pnl,
+                                pnl_pct=pnl_pct,
+                                reason=reason,
+                                balance=state.balance,
+                            )
+                        )
+        except Exception as e:
+            logger.error(f"Failed to check live exits: {e}")
 
     async def _close_all_emergency(self) -> None:
         if TRADING.mode == "live":
@@ -647,6 +740,6 @@ class TradingEngine:
             await close_all_positions("EMERGENCY")
         else:
             from app.execution.paper import close_order
-            for trade_id, trade in list(self.active_trades.items()):
-                await close_order(trade.symbol, trade.entry_price, "EMERGENCY")
-        self.active_trades.clear()
+            for sym in list(state.open_trades.keys()):
+                trade = state.open_trades[sym]
+                await close_order(sym, trade.entry_price, "EMERGENCY")

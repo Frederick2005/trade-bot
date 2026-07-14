@@ -42,13 +42,14 @@ async def run_training() -> dict | None:
         return None
 
     # ── 2. Load features and labels ────────────────────────────────
-    X, y = await get_all_labels()
+    X, y, pnl = await get_all_labels()
     if not X:
         logger.error("No training data returned — aborting")
         return None
 
-    X = np.array(X)
-    y = np.array(y)
+    X   = np.array(X)
+    y   = np.array(y)
+    pnl = np.array(pnl)
 
     # ── 3. Time-ordered train/val split (no data leakage) ──────────
     split      = int(len(X) * 0.80)
@@ -56,6 +57,7 @@ async def run_training() -> dict | None:
     y_train    = y[:split]
     X_val      = X[split:]
     y_val      = y[split:]
+    pnl_val    = pnl[split:]
 
     logger.info(
         f"Split: train={len(X_train)} val={len(X_val)} "
@@ -83,7 +85,7 @@ async def run_training() -> dict | None:
     )
 
     # ── 5. Validate ────────────────────────────────────────────────
-    metrics         = evaluate(model, X_val.tolist(), y_val.tolist())
+    metrics         = evaluate(model, X_val.tolist(), y_val.tolist(), pnl_val.tolist())
     current_acc     = await get_current_model_accuracy()
     deploy, reason  = should_deploy(metrics, current_acc)
 

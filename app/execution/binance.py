@@ -139,6 +139,8 @@ async def close_order(
     exit_price: float,
     reason: str,
 ) -> dict | None:
+    from app.database.trades import close_trade
+
     try:
         trade  = state.open_trades.get(symbol)
         if not trade:
@@ -163,6 +165,18 @@ async def close_order(
             pnl = (trade.entry_price - filled_price) * trade.lot_size
 
         pnl_pct = pnl / state.balance if state.balance else 0.0
+
+        # Same fix as app/execution/paper.py — close_trade() was previously
+        # never called anywhere, so live trades never got marked CLOSED in
+        # the database either.
+        await close_trade(
+            trade_id=trade.trade_id,
+            exit_price=filled_price,
+            profit_loss=pnl,
+            profit_pct=pnl_pct,
+            exit_reason=reason,
+        )
+
         state.record_closed_trade(pnl)
         del state.open_trades[symbol]
 
@@ -173,6 +187,8 @@ async def close_order(
         )
         return {
             "symbol":     symbol,
+            "side":       trade.side,
+            "trade_id":   trade.trade_id,
             "exit_price": filled_price,
             "pnl":        pnl,
             "pnl_pct":    pnl_pct,

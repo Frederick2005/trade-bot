@@ -32,57 +32,51 @@ async def label_closed_trade(
         return False
 
 
-async def get_all_labels() -> tuple[list[list[float]], list[int]]:
+async def get_all_labels() -> tuple[list[list[float]], list[int], list[float]]:
     """
     Fetches all training labels from Supabase.
-    Returns (X, y) where:
-        X = list of feature vectors (each a list of floats)
-        y = list of labels (0 or 1)
+    Returns (X, y, pnl) where:
+        X   = list of feature vectors (each a list of floats)
+        y   = list of labels (0 or 1)
+        pnl = list of pnl_pct values, same order — needed by
+              app.ai.validator.evaluate() to check whether AI-approved
+              trades actually beat baseline expectancy, not just whether
+              the classifier is accurate in the abstract.
     Ordered by created_at to preserve time order for train/val split.
     """
     from app.ai.features import vector_to_list
 
     try:
         client = get_client()
-        all_data = []
-        batch_size = 1000
-        offset = 0
-        while True:
-            result = (
-                client.table("training_labels")
-                .select("features,label")
-                .order("created_at")
-                .range(offset, offset + batch_size - 1)
-                .execute()
-            )
-            batch = result.data or []
-            all_data.extend(batch)
-            if len(batch) < batch_size:
-                break
-            offset += batch_size
-            logger.info(f"Loaded {len(all_data)} labels so far...")
-        data = all_data
+        result = (
+            client.table("training_labels")
+            .select("features,label,pnl_pct")
+            .order("created_at")
+            .execute()
+        )
+        data = result.data or []
 
         if not data:
             logger.warning("No training labels found in database")
-            return [], []
+            return [], [], []
 
-        X, y = [], []
+        X, y, pnl = [], [], []
         for row in data:
             try:
                 vec = vector_to_list(row["features"])
                 X.append(vec)
                 y.append(int(row["label"]))
+                pnl.append(float(row.get("pnl_pct", 0.0)))
             except Exception as e:
                 logger.warning(f"Skipping malformed label row: {e}")
                 continue
 
         logger.info(f"Loaded {len(X)} training examples | wins={sum(y)} losses={len(y)-sum(y)}")
-        return X, y
+        return X, y, pnl
 
     except Exception as e:
         logger.error(f"Failed to load training labels: {e}")
-        return [], []
+        return [], [], []
 
 
 async def get_label_stats() -> dict:
