@@ -31,9 +31,9 @@ Thumbs.db
 # ── Backtesting output ────────────────────────────────────────────────────────
 backtest_results/
 *.html
+data_cache/
 
 # ── Misc ──────────────────────────────────────────────────────────────────────
 *.egg-info/
 dist/
 build/
-data_cache/
